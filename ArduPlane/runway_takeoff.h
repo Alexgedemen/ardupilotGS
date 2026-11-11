@@ -133,6 +133,7 @@ private:
     AP_Float xt_i;             // deg/m/s, cross-track integral gain
     AP_Float xt_imax;          // deg
     AP_Float xt_ispd;          // m/s
+    AP_Float look_max;         // m, lookahead distance cap, 0 for none
 
     // what ends the ground phase
     enum class GroundSource : uint8_t {
@@ -158,6 +159,7 @@ private:
         uint32_t release_ms;   // when the ground phase ended, 0 if it hasn't
         float rud_share;       // rudder share of the steering applied, for logging
         float xt_i;            // deg, cross-track integral term
+        float look_m;          // lookahead distance used, for logging
         uint32_t last_steer_ms;
         uint8_t abort_count;   // consecutive cycles with an abort condition
         float max_abs_xtrk;

@@ -241,6 +241,15 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("XT_ISPD", 25, RunwayTakeoff, xt_ispd, 8),
 
+    // @Param: LOOK_MAX
+    // @DisplayName: Max steering lookahead distance
+    // @Description: If non-zero, caps the RWY_LOOKAHEAD distance (minimum 10 m). Below the cap the lookahead stays time based. 0 means no cap.
+    // @Units: m
+    // @Range: 0 200
+    // @Increment: 5
+    // @User: Advanced
+    AP_GROUPINFO("LOOK_MAX", 26, RunwayTakeoff, look_max, 0),
+
     AP_GROUPEND
 };
 
@@ -485,7 +494,13 @@ void RunwayTakeoff::ground_steering_error(int32_t &bearing_error_cd)
             state.xt_i = constrain_float(state.xt_i - xtrk * xt_i * dt, -imax, imax);
         }
 
-        const float look = MAX(lookahead * gspd, RWY_MIN_LOOKAHEAD_M);
+        // time based lookahead, optionally capped in distance so a
+        // heading error turns into less cross-track at high speed
+        float look = MAX(lookahead * gspd, RWY_MIN_LOOKAHEAD_M);
+        if (is_positive(look_max)) {
+            look = MIN(look, MAX(look_max.get(), RWY_MIN_LOOKAHEAD_M));
+        }
+        state.look_m = look;
         const float xt_corr = constrain_float(-degrees(atan2f(xtrk, look)) + state.xt_i, -cap, cap);
         err = wrap_180(state.bearing_deg + xt_corr - plane.ahrs.get_yaw_deg());
         err *= blend;
