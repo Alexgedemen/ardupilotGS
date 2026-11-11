@@ -143,6 +143,14 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("BRK_RAMP", 14, RunwayTakeoff, brake_ramp, 1),
 
+    // @Param: ABT_ISCL
+    // @DisplayName: Steering integrator kept at abort
+    // @Description: Fraction of the steering integrator kept when a takeoff abort starts. The integrator holds the crosswind correction built up on the roll, which is still needed during the stop. 1 keeps all of it, 0 clears it.
+    // @Range: 0 1
+    // @Increment: 0.05
+    // @User: Advanced
+    AP_GROUPINFO("ABT_ISCL", 15, RunwayTakeoff, abt_iscl, 1),
+
     AP_GROUPEND
 };
 
@@ -444,10 +452,10 @@ void RunwayTakeoff::trigger_abort(const char *reason, float xtrk, float hdg_err,
     GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "RWY: ABORT %s xt %.1f he %.1f v %.1f",
                   reason, (double)xtrk, (double)hdg_err, (double)spd);
 
-    // the steering integrator holds the trim built up on the roll. Under
-    // braking the nosewheel is suddenly more effective, so start the
-    // stop from a clean integrator
-    plane.steerController.reset_I();
+    // the steering integrator holds the crosswind correction built up
+    // on the roll, which is still needed during the stop. Keep the
+    // configured fraction of it
+    plane.steerController.scale_I(constrain_float(abt_iscl, 0, 1));
 
 #if AP_ICENGINE_ENABLED
     // ignition off
