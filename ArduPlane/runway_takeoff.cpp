@@ -103,7 +103,7 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: V1
     // @DisplayName: Takeoff decision speed
-    // @Description: Decision speed (equivalent airspeed estimate, or GPS ground speed if no airspeed estimate is available). Below this speed an abort condition stops the engine and applies full brakes. At or above it the takeoff continues. Required if RWY_ABT_XTRK or RWY_ABT_HDG is set, and must not exceed TKOFF_ROTATE_SPD.
+    // @Description: Decision speed (airspeed from the airspeed sensor when one is in use, otherwise GPS ground speed). Below this speed an abort condition stops the engine and applies full brakes. At or above it the takeoff continues. Required if RWY_ABT_XTRK or RWY_ABT_HDG is set, and must not exceed TKOFF_ROTATE_SPD.
     // @Units: m/s
     // @Range: 0 60
     // @User: Advanced
@@ -134,7 +134,7 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: MAX_CORR
     // @DisplayName: Max steering correction
-    // @Description: Largest heading correction the runway steering will command on the ground, so no position jump or large error can command a hard turn. The steering rate demand is this divided by STEER2SRV_TCONST.
+    // @Description: Largest heading correction the runway steering will command on the ground, so no position jump or large error can command a hard turn. Limits the heading demand; the steering deflection this allows falls with speed.
     // @Units: deg
     // @Range: 2 30
     // @User: Advanced
@@ -268,6 +268,15 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("SLIP_TC", 27, RunwayTakeoff, slip_tc, 0),
 
+    // @Param: HACC_MAX
+    // @DisplayName: Max GPS horizontal accuracy at start
+    // @Description: If non-zero, the takeoff roll is refused unless the GPS reports a horizontal accuracy no worse than this. Use with RTK, where the fix type alone may not show the real accuracy.
+    // @Units: m
+    // @Range: 0 5
+    // @Increment: 0.01
+    // @User: Advanced
+    AP_GROUPINFO("HACC_MAX", 28, RunwayTakeoff, hacc_max, 0),
+
     AP_GROUPEND
 };
 
@@ -371,6 +380,17 @@ bool RunwayTakeoff::launch_allowed(bool in_auto)
     if (!state.line_valid) {
         refuse("RWY: no runway, check TAKEOFF and next WP");
         return false;
+    }
+    if (is_positive(hacc_max)) {
+        float hacc;
+        if (!plane.gps.horizontal_accuracy(hacc)) {
+            refuse("RWY: GPS hacc not reported, RWY_HACC_MAX set");
+            return false;
+        }
+        if (hacc > hacc_max) {
+            refuse("RWY: GPS hacc %.2fm > %.2fm", (double)hacc, (double)hacc_max.get());
+            return false;
+        }
     }
     if (abort_enabled()) {
         if (v1 <= 0) {
@@ -549,6 +569,13 @@ void RunwayTakeoff::ground_steering_error(int32_t &bearing_error_cd)
 void RunwayTakeoff::update_monitor()
 {
     if (!active() || !state.roll_started) {
+        return;
+    }
+
+    if (!hal.util->get_soft_armed() && !state.aborted) {
+        // disarmed after a stop: the roll is over, so don't trip an
+        // abort while the aircraft is pushed around
+        state.roll_started = false;
         return;
     }
 
@@ -853,8 +880,10 @@ float RunwayTakeoff::heading_error_deg() const
 
 float RunwayTakeoff::speed_for_v1() const
 {
+    // only a measured airspeed: the synthetic estimate was off by up to
+    // 1.8 m/s on the ground roll
     float aspd;
-    if (plane.ahrs.airspeed_EAS(aspd)) {
+    if (plane.ahrs.using_airspeed_sensor() && plane.ahrs.airspeed_EAS(aspd)) {
         return aspd;
     }
     return plane.gps.ground_speed();

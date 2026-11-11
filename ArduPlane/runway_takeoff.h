@@ -135,6 +135,7 @@ private:
     AP_Float xt_ispd;          // m/s
     AP_Float look_max;         // m, lookahead distance cap, 0 for none
     AP_Float slip_tc;          // s, slip compensation filter, 0 disables
+    AP_Float hacc_max;         // m, GPS horizontal accuracy gate, 0 disables
 
     // what ends the ground phase
     enum class GroundSource : uint8_t {
