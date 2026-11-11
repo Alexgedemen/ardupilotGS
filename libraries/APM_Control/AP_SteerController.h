@@ -40,6 +40,9 @@ public:
 
 	void reset_I();
 
+    // multiply the integrator by scale, keeping part of the trim it holds
+    void scale_I(float scale) { _pid_info.I *= scale; }
+
 	static const struct AP_Param::GroupInfo var_info[];
 
     const class AP_PIDInfo& get_pid_info(void) const { return _pid_info; }
