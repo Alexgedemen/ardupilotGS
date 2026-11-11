@@ -301,6 +301,7 @@ void RunwayTakeoff::init(const AP_Mission::Mission_Command &cmd)
     state.last_steer_err = 0;
     state.last_refuse_msg_ms = 0;
     state.on_ground = false;
+    state.wow_bad = false;
     state.gnd_src = GroundSource::NONE;
     state.release_ms = 0;
     state.xt_i = 0;
@@ -456,6 +457,16 @@ void RunwayTakeoff::launch_started()
     plane.steer_state.hold_course_cd = runway_heading_cd();
 
     // on the ground until weight on wheels or rotate speed says otherwise
+    state.wow_bad = false;
+#if AP_LANDINGGEAR_ENABLED
+    if (plane.g2.landing_gear.get_wow_state() == AP_LandingGear::LG_NO_WOW) {
+        // the aircraft is on the runway, so a switch reading airborne
+        // now is faulty or the wrong way round. Don't let it end the
+        // ground phase (or the abort window) at the start of the roll
+        state.wow_bad = true;
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "RWY: WoW reads airborne, using rotate speed");
+    }
+#endif
     state.gnd_src = ground_source();
     state.on_ground = state.gnd_src != GroundSource::NONE;
     state.release_ms = 0;
@@ -682,7 +693,8 @@ float RunwayTakeoff::rotate_speed() const
 RunwayTakeoff::GroundSource RunwayTakeoff::ground_source()
 {
 #if AP_LANDINGGEAR_ENABLED
-    if (plane.g2.landing_gear.get_wow_state() != AP_LandingGear::LG_WOW_UNKNOWN) {
+    if (!state.wow_bad &&
+        plane.g2.landing_gear.get_wow_state() != AP_LandingGear::LG_WOW_UNKNOWN) {
         return GroundSource::WOW;
     }
 #endif
@@ -724,7 +736,7 @@ void RunwayTakeoff::update_ground_phase()
 
     if (was_on_ground && !state.on_ground && !state.aborted) {
         state.release_ms = MAX(AP_HAL::millis(), uint32_t(1));
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: off the ground (%s), roll limit fading in",
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: liftoff (%s), roll limit fading in",
                       state.gnd_src == GroundSource::WOW ? "WoW" : "rotate speed");
     } else if (!was_on_ground && state.on_ground) {
         // weight back on the wheels: wings level again, and the fade

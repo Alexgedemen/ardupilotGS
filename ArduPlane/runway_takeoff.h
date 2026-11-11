@@ -166,6 +166,7 @@ private:
         bool aborted;
         bool we_set_estop;
         bool on_ground;        // ground phase trigger says still on the ground
+        bool wow_bad;          // WoW read airborne at the start of the roll
         GroundSource gnd_src;
         uint32_t release_ms;   // when the ground phase ended, 0 if it hasn't
         float rud_share;       // rudder share of the steering applied, for logging
