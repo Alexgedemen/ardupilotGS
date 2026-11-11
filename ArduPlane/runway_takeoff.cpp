@@ -761,6 +761,20 @@ float RunwayTakeoff::handover_factor() const
     return MIN(t / wl_fade, 1.0f);
 }
 
+RunwayTakeoff::WingsLevelState RunwayTakeoff::wings_level_state() const
+{
+    if (wings_lvl == 0) {
+        return WingsLevelState::OFF;
+    }
+    if (hold_wings_level()) {
+        return state.gnd_src == GroundSource::WOW ? WingsLevelState::GROUND_WOW : WingsLevelState::GROUND_ROTATE_SPEED;
+    }
+    if (state.release_ms != 0 && handover_factor() < 1) {
+        return WingsLevelState::HANDOVER;
+    }
+    return WingsLevelState::OFF;
+}
+
 /*
   rudder output while ground steering with a separate nosewheel output.
   During the ground phase the rudders take a speed scheduled share of
@@ -943,7 +957,16 @@ void RunwayTakeoff::write_log(float xtrk, float along, float hdg_err, float spd)
     // @Field: SE: runway steering heading error demand, +ve turn right
     // @Field: V1: true once past V1 (or airborne)
     // @Field: Abt: true once aborted
-    AP::logger().WriteStreaming("RWYT", "TimeUS,XT,AT,HE,Spd,SE,V1,Abt", "smmdnd--", "F0000000", "QfffffBB",
+    // @Field: XTI: cross-track integral term
+    // @Field: LA: lookahead distance used
+    // @Field: Bl: RWY_BLEND fade-in factor applied
+    // @Field: WL: wings level state
+    // @FieldValueEnum: WL: RunwayTakeoff::WingsLevelState
+    // @Field: HF: roll limit handover factor after liftoff
+    // @Field: RSh: rudder share of the steering output applied
+    // @Field: Slp: filtered slip, EKF ground track minus yaw
+    AP::logger().WriteStreaming("RWYT", "TimeUS,XT,AT,HE,Spd,SE,V1,Abt,XTI,LA,Bl,WL,HF,RSh,Slp",
+                                "smmdnd--dm----d", "F00000000000000", "QfffffBBfffBfff",
                                 AP_HAL::micros64(),
                                 (double)xtrk,
                                 (double)along,
@@ -951,7 +974,14 @@ void RunwayTakeoff::write_log(float xtrk, float along, float hdg_err, float spd)
                                 (double)spd,
                                 (double)state.last_steer_err,
                                 uint8_t(state.past_v1),
-                                uint8_t(state.aborted));
+                                uint8_t(state.aborted),
+                                (double)state.xt_i,
+                                (double)state.look_m,
+                                (double)state.blend,
+                                uint8_t(wings_level_state()),
+                                (double)handover_factor(),
+                                (double)state.rud_share,
+                                (double)state.slip_f);
 #endif
 
     // live values for GCS graphing at 5Hz

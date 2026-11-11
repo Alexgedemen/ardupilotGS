@@ -144,6 +144,15 @@ private:
         ROTATE_SPEED = 2,   // highest airspeed reaching the rotate speed
     };
 
+    // for the RWYT WL log field
+    enum class WingsLevelState : uint8_t {
+        OFF                 = 0,
+        GROUND_WOW          = 1,   // wings level, on the ground by weight on wheels
+        GROUND_ROTATE_SPEED = 2,   // wings level, below the rotate speed
+        HANDOVER            = 3,   // roll limit fading in after liftoff
+    };
+    WingsLevelState wings_level_state() const;
+
     struct {
         Location point_a;      // TAKEOFF item: start of the runway line
         Location point_b;      // next waypoint: far end of the line
