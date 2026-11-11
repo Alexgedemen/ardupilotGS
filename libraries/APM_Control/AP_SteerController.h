@@ -68,6 +68,7 @@ private:
 	AP_Float _deratespeed;
 	AP_Float _deratefactor;
 	AP_Float _mindegree;
+	AP_Float _iref;
 
     AP_PIDInfo _pid_info {};
 

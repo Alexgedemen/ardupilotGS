@@ -113,6 +113,15 @@ const AP_Param::GroupInfo AP_SteerController::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("DRTMIN", 10, AP_SteerController, _mindegree,        4500),
 
+    // @Param: IREF
+    // @DisplayName: Integrator reference speed
+    // @Description: If non-zero, the steering integrator rate scales with 1/speed instead of 1/speed squared, and equals the 1/speed squared rate at this speed. Its effect on the turn rate is then the same at all speeds, so it can build up a crosswind correction at high speed. 0 keeps the 1/speed squared scaling.
+    // @Range: 0 30
+    // @Increment: 0.5
+    // @Units: m/s
+    // @User: Advanced
+    AP_GROUPINFO("IREF", 11, AP_SteerController, _iref,        0),
+
 	AP_GROUPEND
 };
 
@@ -169,7 +178,11 @@ int32_t AP_SteerController::get_steering_out_rate(float desired_rate)
 	if (ki_rate > 0 && speed > _minspeed) {
 		// only integrate if gain and time step are positive.
 		if (dt > 0) {
-		    float integrator_delta = rate_error * ki_rate * delta_time * scaler;
+		    // rate_error already carries one 1/speed. With IREF set the
+		    // integrator rate scales with 1/speed overall, matching the
+		    // 1/speed^2 rate at IREF
+		    const float i_scaler = is_positive(_iref) ? 1.0f / _iref : scaler;
+		    float integrator_delta = rate_error * ki_rate * delta_time * i_scaler;
 			// prevent the integrator from increasing if steering defln demand is above the upper limit
 			if (_last_out < -45) {
                 integrator_delta = MAX(integrator_delta , 0);
