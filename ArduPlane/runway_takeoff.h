@@ -134,6 +134,7 @@ private:
     AP_Float xt_imax;          // deg
     AP_Float xt_ispd;          // m/s
     AP_Float look_max;         // m, lookahead distance cap, 0 for none
+    AP_Float slip_tc;          // s, slip compensation filter, 0 disables
 
     // what ends the ground phase
     enum class GroundSource : uint8_t {
@@ -160,6 +161,8 @@ private:
         float rud_share;       // rudder share of the steering applied, for logging
         float xt_i;            // deg, cross-track integral term
         float look_m;          // lookahead distance used, for logging
+        float slip_f;          // deg, filtered EKF track - yaw
+        uint32_t last_slip_ms;
         uint32_t last_steer_ms;
         uint8_t abort_count;   // consecutive cycles with an abort condition
         float max_abs_xtrk;
@@ -182,6 +185,7 @@ private:
     float rotate_speed() const;
     GroundSource ground_source();
     void update_ground_phase();
+    void update_slip(uint32_t now_ms);
 
     void trigger_abort(const char *reason, float xtrk, float hdg_err, float spd);
     bool engine_switch_in_run() const;

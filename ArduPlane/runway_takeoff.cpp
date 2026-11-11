@@ -34,6 +34,12 @@
 // airborne and stop considering an abort
 #define RWY_ABORT_MAX_HEIGHT_M 5.0f
 
+// slip compensation: the EKF ground track is only used above this
+// ground speed (the same as GPS_GND_CRS_MIN_SPD), and the filtered slip
+// is limited to this
+#define RWY_SLIP_MIN_SPD 5.0f
+#define RWY_SLIP_MAX_DEG 10.0f
+
 // weight on wheels must hold a new state this long before the ground
 // phase ends or restarts
 #define RWY_WOW_DEBOUNCE_MS 500U
@@ -250,6 +256,15 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("LOOK_MAX", 26, RunwayTakeoff, look_max, 0),
 
+    // @Param: SLIP_TC
+    // @DisplayName: Slip compensation time constant
+    // @Description: If non-zero, the runway steering compares the A->B direction with yaw plus the low-pass filtered difference between the EKF ground track and yaw, using this time constant. The steering keeps the quick yaw response but holds the ground track to the line, which removes a yaw estimate bias and tyre slip in crosswind. Used above 5 m/s ground speed. 0 disables it.
+    // @Units: s
+    // @Range: 0 5
+    // @Increment: 0.1
+    // @User: Advanced
+    AP_GROUPINFO("SLIP_TC", 27, RunwayTakeoff, slip_tc, 0),
+
     AP_GROUPEND
 };
 
@@ -277,6 +292,7 @@ void RunwayTakeoff::init(const AP_Mission::Mission_Command &cmd)
     state.gnd_src = GroundSource::NONE;
     state.release_ms = 0;
     state.xt_i = 0;
+    state.slip_f = 0;
 
     if (!enabled()) {
         return;
@@ -406,6 +422,8 @@ void RunwayTakeoff::launch_started()
     state.last_report_ms = state.launch_ms;
     state.last_steer_ms = state.launch_ms;
     state.xt_i = 0;
+    state.last_slip_ms = state.launch_ms;
+    state.slip_f = 0;
 
     // steer along the runway from the start of the roll. A non -1
     // hold_course_cd selects calc_nav_yaw_course(), which takes its
@@ -461,15 +479,18 @@ void RunwayTakeoff::ground_steering_error(int32_t &bearing_error_cd)
 
     const float cap = constrain_float(max_corr, 1, 45);
     const float gspd = plane.ahrs.groundspeed();
+    // yaw plus the filtered slip: follows yaw for fast changes and the
+    // EKF ground track for slow ones (0 slip when RWY_SLIP_TC is 0)
+    const float yaw_ref = plane.ahrs.get_yaw_deg() + state.slip_f;
     float err;
 
     if (state.aborted) {
         if (gspd < RWY_ABORT_CENTRE_SPEED) {
             err = 0;
         } else {
-            // braking makes the nosewheel more effective, so steer
-            // more gently while stopping
-            err = wrap_180(state.bearing_deg - plane.ahrs.get_yaw_deg()) * constrain_float(abt_gain, 0.1, 1);
+            // hold a track parallel to the runway. Braking makes the
+            // nosewheel more effective, so steer more gently
+            err = wrap_180(state.bearing_deg - yaw_ref) * constrain_float(abt_gain, 0.1, 1);
         }
     } else {
         float xtrk, along;
@@ -502,7 +523,7 @@ void RunwayTakeoff::ground_steering_error(int32_t &bearing_error_cd)
         }
         state.look_m = look;
         const float xt_corr = constrain_float(-degrees(atan2f(xtrk, look)) + state.xt_i, -cap, cap);
-        err = wrap_180(state.bearing_deg + xt_corr - plane.ahrs.get_yaw_deg());
+        err = wrap_180(state.bearing_deg + xt_corr - yaw_ref);
         err *= blend;
     }
 
@@ -524,6 +545,7 @@ void RunwayTakeoff::update_monitor()
     const float spd = speed_for_v1();
 
     update_ground_phase();
+    update_slip(now_ms);
 
     state.max_abs_xtrk = MAX(state.max_abs_xtrk, fabsf(xtrk));
     write_log(xtrk, along, hdg_err, spd);
@@ -581,6 +603,29 @@ void RunwayTakeoff::takeoff_complete()
     state.roll_started = false;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: takeoff complete, max xt %.1fm",
                   (double)state.max_abs_xtrk);
+}
+
+/*
+  low-pass filtered slip (EKF ground track - yaw), at the navigation
+  rate. Held below RWY_SLIP_MIN_SPD, where the track is poorly defined,
+  so an abort slowing through that speed gets no step
+ */
+void RunwayTakeoff::update_slip(uint32_t now_ms)
+{
+    const float dt = MIN((now_ms - state.last_slip_ms) * 0.001f, 0.2f);
+    state.last_slip_ms = now_ms;
+    if (!is_positive(slip_tc)) {
+        state.slip_f = 0;
+        return;
+    }
+    const Vector2f &v = plane.ahrs.groundspeed_vector();
+    if (v.length() <= RWY_SLIP_MIN_SPD) {
+        return;
+    }
+    const float track = degrees(atan2f(v.y, v.x));
+    const float slip = wrap_180(track - plane.ahrs.get_yaw_deg());
+    state.slip_f += (slip - state.slip_f) * dt / (dt + slip_tc);
+    state.slip_f = constrain_float(state.slip_f, -RWY_SLIP_MAX_DEG, RWY_SLIP_MAX_DEG);
 }
 
 // speed at which the aircraft is taken to leave the ground when there
