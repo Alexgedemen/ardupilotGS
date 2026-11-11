@@ -98,6 +98,10 @@ public:
     // factor applied to the stock takeoff roll limit
     float roll_limit_factor() const { return wings_lvl != 0 ? handover_factor() : 1.0f; }
 
+    // called from stabilize_yaw() when ground steering with a separate
+    // nosewheel output. Returns the rudder output to use
+    float ground_rudder(float steering_out, float coordinated_out);
+
     // called every loop from servos_output() after the outputs have
     // been calculated. Applies the brake override while aborted and
     // clears the abort latch when safe.
@@ -123,6 +127,9 @@ private:
     AP_Int8  wings_lvl;        // wings level on the ground
     AP_Float wl_delay;         // s, roll limit fade delay after liftoff
     AP_Float wl_fade;          // s, roll limit fade time
+    AP_Float rud_max;          // rudder share of the steering, 0 disables
+    AP_Float rud_spd1;         // m/s, share zero at or below
+    AP_Float rud_spd2;         // m/s, share RWY_RUD_MAX at or above
 
     // what ends the ground phase
     enum class GroundSource : uint8_t {
@@ -146,6 +153,7 @@ private:
         bool on_ground;        // ground phase trigger says still on the ground
         GroundSource gnd_src;
         uint32_t release_ms;   // when the ground phase ended, 0 if it hasn't
+        float rud_share;       // rudder share of the steering applied, for logging
         uint8_t abort_count;   // consecutive cycles with an abort condition
         float max_abs_xtrk;
         float last_steer_err;  // deg, for logging

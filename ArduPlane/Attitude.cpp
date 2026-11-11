@@ -414,7 +414,13 @@ void Plane::stabilize_yaw()
 
     } else {
         // Ground steering with both steering and rudder channels
-        SRV_Channels::set_output_scaled(SRV_Channel::k_rudder, rudder_output);
+        float rudder = rudder_output;
+#if AP_PLANE_RUNWAY_TAKEOFF_ENABLED
+        // runway takeoff: the rudders can take a speed scheduled share
+        // of the steering while on the ground
+        rudder = runway_takeoff.ground_rudder(steering_output, rudder_output);
+#endif
+        SRV_Channels::set_output_scaled(SRV_Channel::k_rudder, rudder);
         SRV_Channels::set_output_scaled(SRV_Channel::k_steering, steering_output);
     }
 

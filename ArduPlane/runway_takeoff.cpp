@@ -188,6 +188,32 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("WL_FADE", 19, RunwayTakeoff, wl_fade, 1),
 
+    // @Param: RUD_MAX
+    // @DisplayName: Rudder share of ground steering
+    // @Description: When the nosewheel has its own Ground Steering output, the rudders normally get the coordinated flight output on the ground. If non-zero, during the ground phase of a runway takeoff or abort (see RWY_WINGS_LVL) the rudders instead get this fraction of the steering output, scheduled with speed from RWY_RUD_SPD1 to RWY_RUD_SPD2, and fade back to the coordinated output with the roll limit after liftoff. 0 disables this.
+    // @Range: 0 1
+    // @Increment: 0.05
+    // @User: Advanced
+    AP_GROUPINFO("RUD_MAX", 20, RunwayTakeoff, rud_max, 0),
+
+    // @Param: RUD_SPD1
+    // @DisplayName: Rudder share start speed
+    // @Description: At or below this speed (airspeed sensor if in use, else GPS ground speed) the rudder share of the steering is zero, so the rudders are centred.
+    // @Units: m/s
+    // @Range: 0 30
+    // @Increment: 0.5
+    // @User: Advanced
+    AP_GROUPINFO("RUD_SPD1", 21, RunwayTakeoff, rud_spd1, 5),
+
+    // @Param: RUD_SPD2
+    // @DisplayName: Rudder share full speed
+    // @Description: At or above this speed the rudder share of the steering is RWY_RUD_MAX. Between RWY_RUD_SPD1 and this it rises linearly.
+    // @Units: m/s
+    // @Range: 0 40
+    // @Increment: 0.5
+    // @User: Advanced
+    AP_GROUPINFO("RUD_SPD2", 22, RunwayTakeoff, rud_spd2, 15),
+
     AP_GROUPEND
 };
 
@@ -356,8 +382,8 @@ void RunwayTakeoff::launch_started()
     get_line_errors(xtrk, along);
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: roll xt %.1fm hdg err %.1f rem %.0fm",
                   (double)xtrk, (double)heading_error_deg(), (double)(state.length_m - along));
-    if (state.gnd_src == GroundSource::NONE && wings_lvl != 0) {
-        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "RWY: no WoW or rotate speed, wings level off");
+    if (state.gnd_src == GroundSource::NONE && (wings_lvl != 0 || is_positive(rud_max))) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "RWY: no WoW or rotate speed, wings level and rudder share off");
     }
     if (abort_enabled()) {
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: V1 %.1f abort xt %.1fm hdg %.0f",
@@ -587,6 +613,29 @@ float RunwayTakeoff::handover_factor() const
         return 1;
     }
     return MIN(t / wl_fade, 1.0f);
+}
+
+/*
+  rudder output while ground steering with a separate nosewheel output.
+  During the ground phase the rudders take a speed scheduled share of
+  the steering output instead of the coordinated flight output, then
+  fade back to it with the roll limit after liftoff
+ */
+float RunwayTakeoff::ground_rudder(float steering_out, float coordinated_out)
+{
+    state.rud_share = 0;
+    if (!is_positive(rud_max) || !active() || plane.control_mode != &plane.mode_auto) {
+        return coordinated_out;
+    }
+    const float f = handover_factor();
+    if (f >= 1) {
+        return coordinated_out;
+    }
+    const float share = linear_interpolate(0, constrain_float(rud_max, 0, 1),
+                                           speed_for_v1(),
+                                           rud_spd1, MAX(rud_spd2.get(), rud_spd1.get()));
+    state.rud_share = (1 - f) * share;
+    return state.rud_share * steering_out + f * coordinated_out;
 }
 
 void RunwayTakeoff::trigger_abort(const char *reason, float xtrk, float hdg_err, float spd)
