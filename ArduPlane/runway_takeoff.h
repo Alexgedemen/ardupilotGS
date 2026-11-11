@@ -103,6 +103,7 @@ private:
     AP_Float lookahead;        // s
     AP_Float brake_ramp;       // s
     AP_Float abt_iscl;         // steering integrator fraction kept at abort
+    AP_Float abt_gain;         // heading error gain while aborted
 
     struct {
         Location point_a;      // TAKEOFF item: start of the runway line

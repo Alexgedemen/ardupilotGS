@@ -151,6 +151,14 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("ABT_ISCL", 15, RunwayTakeoff, abt_iscl, 1),
 
+    // @Param: ABT_GAIN
+    // @DisplayName: Steering gain while aborted
+    // @Description: Multiplies the heading error the steering acts on while stopping after an abort. Braking loads the nosewheel and makes it more effective, so a value below 1 keeps the steering loop stable under braking.
+    // @Range: 0.1 1
+    // @Increment: 0.05
+    // @User: Advanced
+    AP_GROUPINFO("ABT_GAIN", 16, RunwayTakeoff, abt_gain, 1),
+
     AP_GROUPEND
 };
 
@@ -354,7 +362,9 @@ void RunwayTakeoff::ground_steering_error(int32_t &bearing_error_cd)
         if (gspd < RWY_ABORT_CENTRE_SPEED) {
             err = 0;
         } else {
-            err = wrap_180(state.bearing_deg - plane.ahrs.get_yaw_deg());
+            // braking makes the nosewheel more effective, so steer
+            // more gently while stopping
+            err = wrap_180(state.bearing_deg - plane.ahrs.get_yaw_deg()) * constrain_float(abt_gain, 0.1, 1);
         }
     } else {
         float xtrk, along;
