@@ -23,6 +23,9 @@
 // minimum lookahead distance for the ground steering law
 #define RWY_MIN_LOOKAHEAD_M 10.0f
 
+// the RWY_BLEND fade-in starts when the ground speed first passes this
+#define RWY_BLEND_START_SPD 1.0f
+
 // below this ground speed after an abort the steering is centred
 #define RWY_ABORT_CENTRE_SPEED 2.0f
 
@@ -123,7 +126,7 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: BLEND
     // @DisplayName: Steering fade-in time
-    // @Description: Time from the start of the roll over which the runway steering correction is faded in, to avoid a step in the steering demand.
+    // @Description: Time over which the runway steering correction is faded in, to avoid a step in the steering demand. The fade starts when the aircraft starts moving (ground speed above 1 m/s) after the roll is triggered.
     // @Units: s
     // @Range: 0 10
     // @User: Advanced
@@ -424,6 +427,8 @@ void RunwayTakeoff::launch_started()
     state.xt_i = 0;
     state.last_slip_ms = state.launch_ms;
     state.slip_f = 0;
+    state.moving_ms = 0;
+    state.blend = 0;
 
     // steer along the runway from the start of the roll. A non -1
     // hold_course_cd selects calc_nav_yaw_course(), which takes its
@@ -497,11 +502,20 @@ void RunwayTakeoff::ground_steering_error(int32_t &bearing_error_cd)
         get_line_errors(xtrk, along);
         const uint32_t now_ms = AP_HAL::millis();
 
-        // fade in from the start of the roll
+        // fade in once the aircraft starts moving, not from the launch
+        // trigger, which can come while it is still held on the brakes
+        if (state.moving_ms == 0 && gspd > RWY_BLEND_START_SPD) {
+            state.moving_ms = MAX(now_ms, uint32_t(1));
+        }
         float blend = 1;
         if (is_positive(blend_time)) {
-            blend = constrain_float((now_ms - state.launch_ms) * 0.001f / blend_time, 0, 1);
+            if (state.moving_ms == 0) {
+                blend = 0;
+            } else {
+                blend = constrain_float((now_ms - state.moving_ms) * 0.001f / blend_time, 0, 1);
+            }
         }
+        state.blend = blend;
 
         // slow crosstrack integral for a standing offset the lookahead
         // law leaves. Only once fully faded in and while the last demand

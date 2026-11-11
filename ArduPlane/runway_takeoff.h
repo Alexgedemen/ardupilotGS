@@ -163,6 +163,8 @@ private:
         float look_m;          // lookahead distance used, for logging
         float slip_f;          // deg, filtered EKF track - yaw
         uint32_t last_slip_ms;
+        uint32_t moving_ms;    // when the aircraft started moving, 0 until then
+        float blend;           // RWY_BLEND factor applied, for logging
         uint32_t last_steer_ms;
         uint8_t abort_count;   // consecutive cycles with an abort condition
         float max_abs_xtrk;
