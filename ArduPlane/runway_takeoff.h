@@ -15,7 +15,8 @@
   simple lookahead law (RWY_LOOKAHEAD), faded in over RWY_BLEND and
   capped at RWY_MAX_CORR. The L1 controller is fed the same line so that
   after liftoff the roll demand follows the extended centreline until
-  the takeoff altitude is reached.
+  the takeoff altitude is reached. While on the ground the wings are
+  held level (RWY_WINGS_LVL) and the roll limit fades in after liftoff.
 
   After an abort the steering stops chasing the line and holds the
   runway direction (straight stop), and the brakes are ramped to full
@@ -82,6 +83,21 @@ public:
     // true once an abort has been triggered (latched until disarmed)
     bool aborted() const { return state.aborted; }
 
+    // true on the takeoff roll or stopping after an abort while still
+    // on the ground (weight on wheels, or below the rotate speed)
+    bool ground_phase() const;
+
+    // true when takeoff_calc_roll() should hold the wings level
+    bool hold_wings_level() const { return wings_lvl != 0 && ground_phase(); }
+
+    // 0 during the ground phase and for RWY_WL_DELAY after it ends,
+    // then rising to 1 over RWY_WL_FADE. 1 when there was no ground
+    // phase on this takeoff
+    float handover_factor() const;
+
+    // factor applied to the stock takeoff roll limit
+    float roll_limit_factor() const { return wings_lvl != 0 ? handover_factor() : 1.0f; }
+
     // called every loop from servos_output() after the outputs have
     // been calculated. Applies the brake override while aborted and
     // clears the abort latch when safe.
@@ -104,6 +120,16 @@ private:
     AP_Float brake_ramp;       // s
     AP_Float abt_iscl;         // steering integrator fraction kept at abort
     AP_Float abt_gain;         // heading error gain while aborted
+    AP_Int8  wings_lvl;        // wings level on the ground
+    AP_Float wl_delay;         // s, roll limit fade delay after liftoff
+    AP_Float wl_fade;          // s, roll limit fade time
+
+    // what ends the ground phase
+    enum class GroundSource : uint8_t {
+        NONE         = 0,   // nothing configured: no ground phase
+        WOW          = 1,   // weight on wheels
+        ROTATE_SPEED = 2,   // highest airspeed reaching the rotate speed
+    };
 
     struct {
         Location point_a;      // TAKEOFF item: start of the runway line
@@ -117,6 +143,9 @@ private:
         bool past_v1;
         bool aborted;
         bool we_set_estop;
+        bool on_ground;        // ground phase trigger says still on the ground
+        GroundSource gnd_src;
+        uint32_t release_ms;   // when the ground phase ended, 0 if it hasn't
         uint8_t abort_count;   // consecutive cycles with an abort condition
         float max_abs_xtrk;
         float last_steer_err;  // deg, for logging
@@ -135,6 +164,9 @@ private:
     float heading_error_deg() const;
     float speed_for_v1() const;
     bool abort_enabled() const;
+    float rotate_speed() const;
+    GroundSource ground_source();
+    void update_ground_phase();
 
     void trigger_abort(const char *reason, float xtrk, float hdg_err, float spd);
     bool engine_switch_in_run() const;

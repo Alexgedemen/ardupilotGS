@@ -167,6 +167,14 @@ void Plane::takeoff_calc_roll(void)
         return;
     }
 
+#if AP_PLANE_RUNWAY_TAKEOFF_ENABLED
+    if (runway_takeoff.hold_wings_level()) {
+        // runway takeoff roll or abort stop, still on the ground
+        nav_roll_cd = 0;
+        return;
+    }
+#endif
+
     calc_nav_roll();
 
     // during takeoff use the level flight roll limit to prevent large
@@ -190,6 +198,11 @@ void Plane::takeoff_calc_roll(void)
                                         current_baro_alt,
                                         auto_state.baro_takeoff_alt+lim1, auto_state.baro_takeoff_alt+lim2);
     }
+
+#if AP_PLANE_RUNWAY_TAKEOFF_ENABLED
+    // runway takeoff: fade the limit in from zero after liftoff
+    takeoff_roll_limit_cd = int32_t(takeoff_roll_limit_cd * runway_takeoff.roll_limit_factor());
+#endif
 
     nav_roll_cd = constrain_int32(nav_roll_cd, -takeoff_roll_limit_cd, takeoff_roll_limit_cd);
 }

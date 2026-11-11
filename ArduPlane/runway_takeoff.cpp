@@ -34,6 +34,10 @@
 // airborne and stop considering an abort
 #define RWY_ABORT_MAX_HEIGHT_M 5.0f
 
+// weight on wheels must hold a new state this long before the ground
+// phase ends or restarts
+#define RWY_WOW_DEBOUNCE_MS 500U
+
 #define RWY_REPORT_INTERVAL_MS 2000U
 #define RWY_REFUSE_MSG_INTERVAL_MS 3000U
 
@@ -159,6 +163,31 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("ABT_GAIN", 16, RunwayTakeoff, abt_gain, 1),
 
+    // @Param: WINGS_LVL
+    // @DisplayName: Wings level on the ground
+    // @Description: Holds the wings level (zero roll demand) on the takeoff roll and while stopping after an abort, until the aircraft leaves the ground. The ground phase ends on weight on wheels (LGR_WOW_PIN) when fitted, otherwise when the airspeed reaches TKOFF_ROTATE_SPD (RWY_V1 if that is 0). The takeoff roll limit then fades in over RWY_WL_DELAY and RWY_WL_FADE. When disabled, the L1 roll demand is used on the ground, limited to LEVEL_ROLL_LIMIT.
+    // @Values: 0:Disabled,1:Enabled
+    // @User: Advanced
+    AP_GROUPINFO("WINGS_LVL", 17, RunwayTakeoff, wings_lvl, 1),
+
+    // @Param: WL_DELAY
+    // @DisplayName: Roll limit fade delay
+    // @Description: Time after the aircraft leaves the ground (weight on wheels, or rotate speed reached) before the takeoff roll limit starts fading in from zero.
+    // @Units: s
+    // @Range: 0 5
+    // @Increment: 0.1
+    // @User: Advanced
+    AP_GROUPINFO("WL_DELAY", 18, RunwayTakeoff, wl_delay, 0),
+
+    // @Param: WL_FADE
+    // @DisplayName: Roll limit fade time
+    // @Description: Time over which the takeoff roll limit fades from zero to the normal takeoff limit (LEVEL_ROLL_LIMIT, then the TKOFF_LVL_ALT scaling) after RWY_WL_DELAY. 0 restores it at once.
+    // @Units: s
+    // @Range: 0 10
+    // @Increment: 0.1
+    // @User: Advanced
+    AP_GROUPINFO("WL_FADE", 19, RunwayTakeoff, wl_fade, 1),
+
     AP_GROUPEND
 };
 
@@ -182,6 +211,9 @@ void RunwayTakeoff::init(const AP_Mission::Mission_Command &cmd)
     state.max_abs_xtrk = 0;
     state.last_steer_err = 0;
     state.last_refuse_msg_ms = 0;
+    state.on_ground = false;
+    state.gnd_src = GroundSource::NONE;
+    state.release_ms = 0;
 
     if (!enabled()) {
         return;
@@ -315,10 +347,18 @@ void RunwayTakeoff::launch_started()
     // error from ground_steering_error()
     plane.steer_state.hold_course_cd = runway_heading_cd();
 
+    // on the ground until weight on wheels or rotate speed says otherwise
+    state.gnd_src = ground_source();
+    state.on_ground = state.gnd_src != GroundSource::NONE;
+    state.release_ms = 0;
+
     float xtrk, along;
     get_line_errors(xtrk, along);
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: roll xt %.1fm hdg err %.1f rem %.0fm",
                   (double)xtrk, (double)heading_error_deg(), (double)(state.length_m - along));
+    if (state.gnd_src == GroundSource::NONE && wings_lvl != 0) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "RWY: no WoW or rotate speed, wings level off");
+    }
     if (abort_enabled()) {
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: V1 %.1f abort xt %.1fm hdg %.0f",
                       (double)v1.get(), (double)abort_xtrk.get(), (double)abort_hdg.get());
@@ -397,6 +437,8 @@ void RunwayTakeoff::update_monitor()
     const float hdg_err = heading_error_deg();
     const float spd = speed_for_v1();
 
+    update_ground_phase();
+
     state.max_abs_xtrk = MAX(state.max_abs_xtrk, fabsf(xtrk));
     write_log(xtrk, along, hdg_err, spd);
 
@@ -416,7 +458,8 @@ void RunwayTakeoff::update_monitor()
             state.past_v1 = true;
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: V1 %.1f, continuing takeoff (xt %.1fm)",
                           (double)spd, (double)xtrk);
-        } else if (plane.barometer.get_altitude() - plane.auto_state.baro_takeoff_alt > RWY_ABORT_MAX_HEIGHT_M) {
+        } else if (plane.barometer.get_altitude() - plane.auto_state.baro_takeoff_alt > RWY_ABORT_MAX_HEIGHT_M ||
+                   (state.gnd_src == GroundSource::WOW && !state.on_ground)) {
             state.past_v1 = true;
             GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "RWY: airborne below V1, abort disabled");
         }
@@ -452,6 +495,98 @@ void RunwayTakeoff::takeoff_complete()
     state.roll_started = false;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: takeoff complete, max xt %.1fm",
                   (double)state.max_abs_xtrk);
+}
+
+// speed at which the aircraft is taken to leave the ground when there
+// is no weight on wheels sensor
+float RunwayTakeoff::rotate_speed() const
+{
+    if (is_positive(plane.g.takeoff_rotate_speed)) {
+        return plane.g.takeoff_rotate_speed;
+    }
+    return v1;
+}
+
+RunwayTakeoff::GroundSource RunwayTakeoff::ground_source()
+{
+#if AP_LANDINGGEAR_ENABLED
+    if (plane.g2.landing_gear.get_wow_state() != AP_LandingGear::LG_WOW_UNKNOWN) {
+        return GroundSource::WOW;
+    }
+#endif
+    if (is_positive(rotate_speed())) {
+        return GroundSource::ROTATE_SPEED;
+    }
+    return GroundSource::NONE;
+}
+
+/*
+  decide whether the aircraft is still on the ground. Called at the
+  navigation rate from update_monitor(); takeoff_calc_roll() and
+  stabilize_yaw() only read the result
+ */
+void RunwayTakeoff::update_ground_phase()
+{
+    const bool was_on_ground = state.on_ground;
+    state.gnd_src = ground_source();
+
+    switch (state.gnd_src) {
+#if AP_LANDINGGEAR_ENABLED
+    case GroundSource::WOW:
+        // debounced both ways, so a bounce goes back to the ground phase
+        if (plane.g2.landing_gear.get_wow_state_duration_ms() >= RWY_WOW_DEBOUNCE_MS) {
+            state.on_ground = plane.g2.landing_gear.get_wow_state() == AP_LandingGear::LG_WOW;
+        }
+        break;
+#endif
+    case GroundSource::ROTATE_SPEED:
+        // the speed stock uses to rotate. highest_airspeed only grows,
+        // so this latches
+        state.on_ground = plane.auto_state.highest_airspeed < rotate_speed();
+        break;
+    case GroundSource::NONE:
+    default:
+        state.on_ground = false;
+        break;
+    }
+
+    if (was_on_ground && !state.on_ground && !state.aborted) {
+        state.release_ms = MAX(AP_HAL::millis(), uint32_t(1));
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: off the ground (%s), roll limit fading in",
+                      state.gnd_src == GroundSource::WOW ? "WoW" : "rotate speed");
+    } else if (!was_on_ground && state.on_ground) {
+        // weight back on the wheels: wings level again, and the fade
+        // restarts at the next release
+        state.release_ms = 0;
+    }
+}
+
+bool RunwayTakeoff::ground_phase() const
+{
+    if (!active() || plane.control_mode != &plane.mode_auto ||
+        !(state.roll_started || state.aborted)) {
+        return false;
+    }
+    return state.aborted || state.on_ground;
+}
+
+float RunwayTakeoff::handover_factor() const
+{
+    if (ground_phase()) {
+        return 0;
+    }
+    if (!active() || state.release_ms == 0) {
+        // no ground phase on this takeoff
+        return 1;
+    }
+    const float t = (AP_HAL::millis() - state.release_ms) * 0.001f - MAX(wl_delay.get(), 0.0f);
+    if (t <= 0) {
+        return 0;
+    }
+    if (!is_positive(wl_fade)) {
+        return 1;
+    }
+    return MIN(t / wl_fade, 1.0f);
 }
 
 void RunwayTakeoff::trigger_abort(const char *reason, float xtrk, float hdg_err, float spd)
