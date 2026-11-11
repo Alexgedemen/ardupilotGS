@@ -130,6 +130,9 @@ private:
     AP_Float rud_max;          // rudder share of the steering, 0 disables
     AP_Float rud_spd1;         // m/s, share zero at or below
     AP_Float rud_spd2;         // m/s, share RWY_RUD_MAX at or above
+    AP_Float xt_i;             // deg/m/s, cross-track integral gain
+    AP_Float xt_imax;          // deg
+    AP_Float xt_ispd;          // m/s
 
     // what ends the ground phase
     enum class GroundSource : uint8_t {
@@ -154,6 +157,8 @@ private:
         GroundSource gnd_src;
         uint32_t release_ms;   // when the ground phase ended, 0 if it hasn't
         float rud_share;       // rudder share of the steering applied, for logging
+        float xt_i;            // deg, cross-track integral term
+        uint32_t last_steer_ms;
         uint8_t abort_count;   // consecutive cycles with an abort condition
         float max_abs_xtrk;
         float last_steer_err;  // deg, for logging

@@ -214,6 +214,33 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("RUD_SPD2", 22, RunwayTakeoff, rud_spd2, 15),
 
+    // @Param: XT_I
+    // @DisplayName: Cross-track integral gain
+    // @Description: Gain of a slow integral of the cross-track error added to the runway steering heading demand, to remove a standing offset from the centreline. Degrees of heading demand per second, per metre of cross-track error. 0 disables it.
+    // @Units: deg/m/s
+    // @Range: 0 1
+    // @Increment: 0.01
+    // @User: Advanced
+    AP_GROUPINFO("XT_I", 23, RunwayTakeoff, xt_i, 0),
+
+    // @Param: XT_IMAX
+    // @DisplayName: Cross-track integral limit
+    // @Description: Largest heading demand the cross-track integral can add.
+    // @Units: deg
+    // @Range: 0 10
+    // @Increment: 0.5
+    // @User: Advanced
+    AP_GROUPINFO("XT_IMAX", 24, RunwayTakeoff, xt_imax, 3),
+
+    // @Param: XT_ISPD
+    // @DisplayName: Cross-track integral min speed
+    // @Description: The cross-track integral only builds above this ground speed.
+    // @Units: m/s
+    // @Range: 0 30
+    // @Increment: 0.5
+    // @User: Advanced
+    AP_GROUPINFO("XT_ISPD", 25, RunwayTakeoff, xt_ispd, 8),
+
     AP_GROUPEND
 };
 
@@ -240,6 +267,7 @@ void RunwayTakeoff::init(const AP_Mission::Mission_Command &cmd)
     state.on_ground = false;
     state.gnd_src = GroundSource::NONE;
     state.release_ms = 0;
+    state.xt_i = 0;
 
     if (!enabled()) {
         return;
@@ -367,6 +395,8 @@ void RunwayTakeoff::launch_started()
     state.max_abs_xtrk = 0;
     state.launch_ms = AP_HAL::millis();
     state.last_report_ms = state.launch_ms;
+    state.last_steer_ms = state.launch_ms;
+    state.xt_i = 0;
 
     // steer along the runway from the start of the roll. A non -1
     // hold_course_cd selects calc_nav_yaw_course(), which takes its
@@ -435,15 +465,30 @@ void RunwayTakeoff::ground_steering_error(int32_t &bearing_error_cd)
     } else {
         float xtrk, along;
         get_line_errors(xtrk, along);
-        const float look = MAX(lookahead * gspd, RWY_MIN_LOOKAHEAD_M);
-        const float xt_corr = constrain_float(-degrees(atan2f(xtrk, look)), -cap, cap);
-        err = wrap_180(state.bearing_deg + xt_corr - plane.ahrs.get_yaw_deg());
+        const uint32_t now_ms = AP_HAL::millis();
 
         // fade in from the start of the roll
+        float blend = 1;
         if (is_positive(blend_time)) {
-            const float t = (AP_HAL::millis() - state.launch_ms) * 0.001f;
-            err *= constrain_float(t / blend_time, 0, 1);
+            blend = constrain_float((now_ms - state.launch_ms) * 0.001f / blend_time, 0, 1);
         }
+
+        // slow crosstrack integral for a standing offset the lookahead
+        // law leaves. Only once fully faded in and while the last demand
+        // was inside the cap, so it can't wind up
+        const float dt = MIN((now_ms - state.last_steer_ms) * 0.001f, 0.1f);
+        state.last_steer_ms = now_ms;
+        if (!is_positive(xt_i)) {
+            state.xt_i = 0;
+        } else if (gspd > xt_ispd && blend >= 1 && fabsf(state.last_steer_err) < cap) {
+            const float imax = MAX(xt_imax.get(), 0.0f);
+            state.xt_i = constrain_float(state.xt_i - xtrk * xt_i * dt, -imax, imax);
+        }
+
+        const float look = MAX(lookahead * gspd, RWY_MIN_LOOKAHEAD_M);
+        const float xt_corr = constrain_float(-degrees(atan2f(xtrk, look)) + state.xt_i, -cap, cap);
+        err = wrap_180(state.bearing_deg + xt_corr - plane.ahrs.get_yaw_deg());
+        err *= blend;
     }
 
     err = constrain_float(err, -cap, cap);
