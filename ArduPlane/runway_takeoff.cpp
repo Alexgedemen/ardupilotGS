@@ -48,6 +48,10 @@
 // value and RWY_LOOK_MAX when deceleration starts or stops
 #define RWY_DECEL_LOOK_TIME_S 1.0f
 
+// time for the brake value used to soften the steering to follow a
+// full step in the brake output
+#define RWY_BRK_SOFT_TIME_S 0.5f
+
 // fraction of RWY_MAX_CORR allowed for the return to the centreline
 // after an abort
 #define RWY_ABORT_CORR_FRAC 0.5f
@@ -180,12 +184,21 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("LOOK_MAX", 16, RunwayTakeoff, look_max, 0),
 
+    // @Param: BRK_GAIN
+    // @DisplayName: Steering gain at full brake
+    // @Description: Runway steering response to heading error at full brake, relative to unbraked. Braking makes the nosewheel more effective, so the response is reduced in proportion to the brake applied (from the brake output against its SERVOn_TRIM and RWY_BRK_PWM), down to this at full brake. Applies to any braking during the roll or an abort. 1.0 leaves the steering unchanged.
+    // @Range: 0.1 1
+    // @Increment: 0.05
+    // @User: Advanced
+    AP_GROUPINFO("BRK_GAIN", 17, RunwayTakeoff, brk_gain, 1),
+
     AP_GROUPEND
 };
 
 RunwayTakeoff::RunwayTakeoff(void)
 {
     AP_Param::setup_object_defaults(this, var_info);
+    state.steer_soft = 1;
 }
 
 /*
@@ -497,6 +510,11 @@ void RunwayTakeoff::ground_steering_error(int32_t &bearing_error_cd)
     }
 
     err = constrain_float(err, -cap, cap);
+
+    // under braking, reduce the response to heading error (RWY_BRK_GAIN).
+    // Scaling the error leaves the integrator's stored value alone
+    err *= state.steer_soft;
+
     state.last_steer_err = err;
     bearing_error_cd = int32_t(err * 100);
 }
@@ -669,10 +687,19 @@ void RunwayTakeoff::update_brakes()
         state.brake_frac = 0;
         state.decel_flags = 0;
         state.decel_frac = 0;
+        state.brake_soft = 0;
+        state.steer_soft = 1;
         return;
     }
 
     state.brake_frac = brake_fraction();
+
+    // steering softening under braking. The brake value used follows
+    // the output at a limited rate, so there is no step in the steering
+    // when the brakes come on or go off
+    const float bstep = dt / RWY_BRK_SOFT_TIME_S;
+    state.brake_soft += constrain_float(state.brake_frac - state.brake_soft, -bstep, bstep);
+    state.steer_soft = 1 - (1 - constrain_float(brk_gain, 0.1, 1)) * state.brake_soft;
 
     uint8_t flags = 0;
     if (state.brake_frac >= RWY_BRAKE_ON_FRAC) {
@@ -872,7 +899,8 @@ void RunwayTakeoff::write_log(float xtrk, float along, float hdg_err, float spd)
     // @Field: LA: steering lookahead distance used
     // @Field: DC: decelerating, and why: bit 0 brakes, bit 1 throttle closed or engine off, bit 2 abort
     // @Field: BF: brake applied, 0 to 1
-    AP::logger().WriteStreaming("RWYT", "TimeUS,XT,AT,HE,Spd,SE,V1,Abt,GP,WL,LA,DC,BF", "smmdnd----m--", "F000000000000", "QfffffBBBffBf",
+    // @Field: SF: steering softening factor applied under braking, 1 is none
+    AP::logger().WriteStreaming("RWYT", "TimeUS,XT,AT,HE,Spd,SE,V1,Abt,GP,WL,LA,DC,BF,SF", "smmdnd----m---", "F0000000000000", "QfffffBBBffBff",
                                 AP_HAL::micros64(),
                                 (double)xtrk,
                                 (double)along,
@@ -885,7 +913,8 @@ void RunwayTakeoff::write_log(float xtrk, float along, float hdg_err, float spd)
                                 (double)state.wl_factor,
                                 (double)state.last_look,
                                 state.decel_flags,
-                                (double)state.brake_frac);
+                                (double)state.brake_frac,
+                                (double)state.steer_soft);
 #endif
 
     // live values for GCS graphing at 5Hz

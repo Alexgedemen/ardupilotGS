@@ -124,6 +124,7 @@ private:
     AP_Float brake_ramp;       // s
     AP_Float wl_fade;          // s
     AP_Float look_max;         // m, 0 disables
+    AP_Float brk_gain;         // steering gain at full brake, 1 disables
 
     struct {
         Location point_a;      // TAKEOFF item: start of the runway line
@@ -158,6 +159,8 @@ private:
         float decel_frac;      // 0 normal lookahead to 1 RWY_LOOK_MAX
         uint32_t last_brake_us;
         bool abort_hold_hdg;   // latched: hold the runway direction for the rest of the stop
+        float brake_soft;      // brake applied, rate limited, for steer_soft
+        float steer_soft;      // steering softening factor applied, RWY_BRK_GAIN to 1
     } state;
 
     // causes of deceleration, logged in RWYT.DC
