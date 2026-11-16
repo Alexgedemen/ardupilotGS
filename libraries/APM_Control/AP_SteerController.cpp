@@ -113,6 +113,15 @@ const AP_Param::GroupInfo AP_SteerController::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("DRTMIN", 10, AP_SteerController, _mindegree,        4500),
 
+    // @Param: IREF
+    // @DisplayName: Integrator reference speed
+    // @Description: If non-zero, the integrator builds at a rate that falls with 1/speed instead of 1/speed squared, matching the default integrator at this speed: slower below it and faster above it, so steady offsets are trimmed out faster at high ground speed. P, FF and D keep their 1/speed scaling. 0 keeps the default integrator.
+    // @Range: 0 30
+    // @Increment: 0.5
+    // @Units: m/s
+    // @User: Advanced
+    AP_GROUPINFO("IREF", 11, AP_SteerController, _iref,        0),
+
 	AP_GROUPEND
 };
 
@@ -170,7 +179,11 @@ int32_t AP_SteerController::get_steering_out_rate(float desired_rate)
 	if (ki_rate > 0 && measured_speed >= _minspeed) {
 		// only integrate if gain and time step are positive.
 		if (dt > 0) {
-		    float integrator_delta = rate_error * ki_rate * delta_time * scaler;
+		    // rate_error already carries 1/speed. A second 1/speed gives
+		    // the default 1/speed^2 build rate; 1/IREF instead gives
+		    // 1/speed, equal to the default at speed == IREF
+		    const float i_scaler = is_positive(_iref) ? 1.0f / _iref : scaler;
+		    float integrator_delta = rate_error * ki_rate * delta_time * i_scaler;
 			// prevent the integrator from increasing if steering defln demand is above the upper limit
 			if (_last_out < -45) {
                 integrator_delta = MAX(integrator_delta , 0);
