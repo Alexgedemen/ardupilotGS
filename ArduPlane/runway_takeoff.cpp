@@ -41,8 +41,8 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: ENABLE
     // @DisplayName: Runway takeoff enable
-    // @Description: Enables runway centreline tracking for AUTO takeoffs. The runway line runs from the NAV_TAKEOFF item lat/lon (point A, surveyed centreline point at the start end) to the next mission waypoint (point B, surveyed centreline point at the departure end or beyond). When enabled, auto takeoff is refused if the runway is not defined or the start checks fail.
-    // @Values: 0:Disabled,1:Enabled
+    // @Description: Bit 0 enables runway centreline tracking for AUTO takeoffs. The runway line runs from the NAV_TAKEOFF item lat/lon (point A, surveyed centreline point at the start end) to the next mission waypoint (point B, surveyed centreline point at the departure end or beyond). When enabled, auto takeoff is refused if the runway is not defined or the start checks fail. Bit 1 holds the wings level on the ground: no bank demand from the start of the roll until TKOFF_ROTATE_SPD (RWY_V1 if that is 0) or, if a weight on wheels switch is configured, while it reads on the ground, and throughout an abort; then the stock takeoff roll limit is restored over RWY_WL_FADE. The other bits do nothing unless bit 0 is set.
+    // @Bitmask: 0:Runway takeoff,1:Wings level on the ground
     // @User: Advanced
     AP_GROUPINFO_FLAGS("ENABLE", 1, RunwayTakeoff, enable, 0, AP_PARAM_FLAG_ENABLE),
 
@@ -142,6 +142,15 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
     // @Range: 0 5
     // @User: Advanced
     AP_GROUPINFO("BRK_RAMP", 14, RunwayTakeoff, brake_ramp, 1),
+
+    // @Param: WL_FADE
+    // @DisplayName: Wings level hand-back time
+    // @Description: With RWY_ENABLE bit 1 set, the time over which the roll limit is raised from zero back to the stock takeoff roll limit (LEVEL_ROLL_LIMIT, then the TKOFF_LVL_ALT scaling) once the ground phase ends. 0 restores it at once.
+    // @Units: s
+    // @Range: 0 5
+    // @Increment: 0.1
+    // @User: Advanced
+    AP_GROUPINFO("WL_FADE", 15, RunwayTakeoff, wl_fade, 1),
 
     AP_GROUPEND
 };
@@ -253,6 +262,20 @@ bool RunwayTakeoff::launch_allowed(bool in_auto)
             return false;
         }
     }
+    if (option_set(Option::WINGS_LEVEL)) {
+        if (wow_available()) {
+#if AP_LANDINGGEAR_ENABLED
+            if (plane.g2.landing_gear.get_wow_state() != AP_LandingGear::LG_WOW) {
+                refuse("RWY: weight on wheels switch reads airborne");
+                return false;
+            }
+#endif
+        } else if (plane.g.takeoff_rotate_speed <= 0 && v1 <= 0) {
+            // nothing would end the ground phase
+            refuse("RWY: wings level needs TKOFF_ROTATE_SPD or RWY_V1");
+            return false;
+        }
+    }
 
     float xtrk, along;
     get_line_errors(xtrk, along);
@@ -289,6 +312,7 @@ void RunwayTakeoff::launch_started()
     }
     state.roll_started = true;
     state.past_v1 = false;
+    state.past_rotate = false;
     state.abort_count = 0;
     state.max_abs_xtrk = 0;
     state.launch_ms = AP_HAL::millis();
@@ -322,6 +346,66 @@ int32_t RunwayTakeoff::runway_heading_cd() const
 void RunwayTakeoff::update_l1()
 {
     plane.nav_controller->update_waypoint(state.l1_start, state.l1_end);
+}
+
+/*
+  track the ground phase of the takeoff: from the start of the roll
+  until rotate speed (or, with a weight on wheels switch, while it reads
+  on the ground), and throughout an abort. Sets the roll limit hand-back
+  factor: 0 in the ground phase, then ramped to 1 over RWY_WL_FADE
+ */
+void RunwayTakeoff::update_ground_phase()
+{
+    if (!active() || plane.control_mode != &plane.mode_auto ||
+        !(state.roll_started || state.aborted)) {
+        state.ground_phase = false;
+        state.ground_end_ms = 0;
+        state.wl_factor = 1;
+        return;
+    }
+
+    // rotate speed latches: speed alone can't detect a bounce
+    if (!state.past_rotate && reached_rotate_speed()) {
+        state.past_rotate = true;
+    }
+
+    bool on_ground = !state.past_rotate;
+#if AP_LANDINGGEAR_ENABLED
+    if (wow_available()) {
+        // a bounce returns to the ground phase
+        on_ground = plane.g2.landing_gear.get_wow_state() == AP_LandingGear::LG_WOW;
+    }
+#endif
+    if (state.aborted) {
+        on_ground = true;
+    }
+
+    const uint32_t now_ms = AP_HAL::millis();
+    state.ground_phase = on_ground;
+    if (on_ground) {
+        state.ground_end_ms = 0;
+        state.wl_factor = 0;
+    } else {
+        if (state.ground_end_ms == 0) {
+            state.ground_end_ms = MAX(now_ms, 1U);
+        }
+        if (is_positive(wl_fade)) {
+            state.wl_factor = constrain_float((now_ms - state.ground_end_ms) * 0.001f / wl_fade, 0, 1);
+        } else {
+            state.wl_factor = 1;
+        }
+    }
+    if (!option_set(Option::WINGS_LEVEL)) {
+        state.wl_factor = 1;
+    }
+}
+
+int32_t RunwayTakeoff::ground_roll_limit_cd(int32_t stock_limit_cd)
+{
+    update_ground_phase();
+    // scaling the stock limit leaves no step at the hand-back, and
+    // follows the TKOFF_LVL_ALT scaling once it applies
+    return int32_t(stock_limit_cd * state.wl_factor);
 }
 
 /*
@@ -379,6 +463,7 @@ void RunwayTakeoff::update_monitor()
     const float hdg_err = heading_error_deg();
     const float spd = speed_for_v1();
 
+    update_ground_phase();
     state.max_abs_xtrk = MAX(state.max_abs_xtrk, fabsf(xtrk));
     write_log(xtrk, along, hdg_err, spd);
 
@@ -544,6 +629,31 @@ bool RunwayTakeoff::abort_enabled() const
 }
 
 /*
+  end of the ground phase by speed: TKOFF_ROTATE_SPD on the same speed
+  the stock takeoff rotates on, or RWY_V1 if no rotate speed is set
+ */
+bool RunwayTakeoff::reached_rotate_speed() const
+{
+    if (plane.g.takeoff_rotate_speed > 0) {
+        return plane.auto_state.highest_airspeed >= plane.g.takeoff_rotate_speed;
+    }
+    if (v1 > 0) {
+        return speed_for_v1() >= v1;
+    }
+    return false;
+}
+
+// true if a weight on wheels switch is configured
+bool RunwayTakeoff::wow_available()
+{
+#if AP_LANDINGGEAR_ENABLED
+    return plane.g2.landing_gear.get_wow_state() != AP_LandingGear::LG_WOW_UNKNOWN;
+#else
+    return false;
+#endif
+}
+
+/*
   true if an ICE start/stop RC switch is configured and is (or may be)
   asking for the engine to run. With no switch configured (engine
   started and stopped by MAVLink commands) this is always false, so the
@@ -592,7 +702,9 @@ void RunwayTakeoff::write_log(float xtrk, float along, float hdg_err, float spd)
     // @Field: SE: runway steering heading error demand, +ve turn right
     // @Field: V1: true once past V1 (or airborne)
     // @Field: Abt: true once aborted
-    AP::logger().WriteStreaming("RWYT", "TimeUS,XT,AT,HE,Spd,SE,V1,Abt", "smmdnd--", "F0000000", "QfffffBB",
+    // @Field: GP: true in the ground phase (on the runway, or aborted)
+    // @Field: WL: roll limit hand-back factor applied, 0 wings held level to 1 stock limit
+    AP::logger().WriteStreaming("RWYT", "TimeUS,XT,AT,HE,Spd,SE,V1,Abt,GP,WL", "smmdnd----", "F000000000", "QfffffBBBf",
                                 AP_HAL::micros64(),
                                 (double)xtrk,
                                 (double)along,
@@ -600,7 +712,9 @@ void RunwayTakeoff::write_log(float xtrk, float along, float hdg_err, float spd)
                                 (double)spd,
                                 (double)state.last_steer_err,
                                 uint8_t(state.past_v1),
-                                uint8_t(state.aborted));
+                                uint8_t(state.aborted),
+                                uint8_t(state.ground_phase),
+                                (double)state.wl_factor);
 #endif
 
     // live values for GCS graphing at 5Hz

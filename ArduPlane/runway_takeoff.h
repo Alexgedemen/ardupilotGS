@@ -21,6 +21,10 @@
   runway direction (straight stop), and the brakes are ramped to full
   over RWY_BRK_RAMP.
 
+  RWY_ENABLE bit 1 holds the wings level while on the runway, including
+  during an abort, and hands back to the stock roll limit over
+  RWY_WL_FADE once rotate speed is reached.
+
   With RWY_ENABLE=0 the stock takeoff behaviour is unchanged.
  */
 
@@ -43,7 +47,15 @@ public:
 
     static const struct AP_Param::GroupInfo var_info[];
 
-    bool enabled() const { return enable.get() != 0; }
+    // RWY_ENABLE bits
+    enum class Option : uint8_t {
+        RUNWAY_TAKEOFF = (1U << 0),
+        WINGS_LEVEL    = (1U << 1),
+    };
+
+    // bit 0 enables the feature; the other bits only act with it set
+    bool enabled() const { return (uint8_t(enable.get()) & uint8_t(Option::RUNWAY_TAKEOFF)) != 0; }
+    bool option_set(Option opt) const { return enabled() && (uint8_t(enable.get()) & uint8_t(opt)) != 0; }
 
     // called from do_takeoff() with the NAV_TAKEOFF mission item
     void init(const AP_Mission::Mission_Command &cmd);
@@ -66,6 +78,11 @@ public:
 
     // feed the L1 controller with the runway line (roll demand)
     void update_l1();
+
+    // called from takeoff_calc_roll() with the stock takeoff roll
+    // limit. Returns the limit to apply: zero while on the runway
+    // (RWY_ENABLE bit 1), then faded back to the stock limit
+    int32_t ground_roll_limit_cd(int32_t stock_limit_cd);
 
     // called from calc_nav_yaw_course(). Replaces the L1 bearing error
     // with the runway ground steering error while on the takeoff roll
@@ -102,6 +119,7 @@ private:
     AP_Float max_corr;         // deg
     AP_Float lookahead;        // s
     AP_Float brake_ramp;       // s
+    AP_Float wl_fade;          // s
 
     struct {
         Location point_a;      // TAKEOFF item: start of the runway line
@@ -125,6 +143,10 @@ private:
         uint32_t last_refuse_msg_ms;
         uint32_t last_log_ms;
         uint32_t last_clear_msg_ms;
+        bool ground_phase;     // on the runway: wings held level
+        bool past_rotate;      // rotate speed reached on this roll
+        uint32_t ground_end_ms; // when the ground phase last ended, 0 while in it
+        float wl_factor;       // roll limit hand-back, 0 (level) to 1 (stock)
     } state;
 
     // geometry relative to the runway line. xtrk +ve = right of the
@@ -133,6 +155,9 @@ private:
     float heading_error_deg() const;
     float speed_for_v1() const;
     bool abort_enabled() const;
+    bool reached_rotate_speed() const;
+    bool wow_available();
+    void update_ground_phase();
 
     void trigger_abort(const char *reason, float xtrk, float hdg_err, float spd);
     bool engine_switch_in_run() const;

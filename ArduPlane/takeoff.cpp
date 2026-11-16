@@ -191,6 +191,11 @@ void Plane::takeoff_calc_roll(void)
                                         auto_state.baro_takeoff_alt+lim1, auto_state.baro_takeoff_alt+lim2);
     }
 
+#if AP_PLANE_RUNWAY_TAKEOFF_ENABLED
+    // runway takeoff: wings level while on the ground
+    takeoff_roll_limit_cd = runway_takeoff.ground_roll_limit_cd(takeoff_roll_limit_cd);
+#endif
+
     nav_roll_cd = constrain_int32(nav_roll_cd, -takeoff_roll_limit_cd, takeoff_roll_limit_cd);
 }
 
