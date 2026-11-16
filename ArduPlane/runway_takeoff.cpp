@@ -96,7 +96,7 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: STRT_XTRK
     // @DisplayName: Max start cross-track error
-    // @Description: Takeoff is refused if the aircraft is further than this from the runway centreline when the takeoff roll would start.
+    // @Description: Takeoff is refused if the aircraft is further than this from the runway centreline when the takeoff roll would start, or if the GPS horizontal accuracy is not available or worse than half of this.
     // @Units: m
     // @Range: 0.5 20
     // @User: Advanced
@@ -136,7 +136,7 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: V1
     // @DisplayName: Takeoff decision speed
-    // @Description: Decision speed (equivalent airspeed estimate, or GPS ground speed if no airspeed estimate is available). Below this speed an abort condition stops the engine and applies full brakes. At or above it the takeoff continues. Required if RWY_ABT_XTRK or RWY_ABT_HDG is set, and must not exceed TKOFF_ROTATE_SPD.
+    // @Description: Decision speed: airspeed if the AHRS is using an airspeed sensor, otherwise GPS ground speed. Below this speed an abort condition stops the engine and applies full brakes. At or above it the takeoff continues. Required if RWY_ABT_XTRK or RWY_ABT_HDG is set, and must not exceed TKOFF_ROTATE_SPD.
     // @Units: m/s
     // @Range: 0 60
     // @User: Advanced
@@ -167,7 +167,7 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: MAX_CORR
     // @DisplayName: Max steering correction
-    // @Description: Largest heading correction the runway steering will command on the ground, so no position jump or large error can command a hard turn. The steering rate demand is this divided by STEER2SRV_TCONST.
+    // @Description: Limits the heading demand; the steering deflection this allows falls with speed.
     // @Units: deg
     // @Range: 2 30
     // @User: Advanced
@@ -348,6 +348,18 @@ bool RunwayTakeoff::launch_allowed(bool in_auto)
             refuse("RWY: wings level needs TKOFF_ROTATE_SPD or RWY_V1");
             return false;
         }
+    }
+
+    // the start cross-track check is only as good as the position
+    float hacc;
+    if (!plane.gps.horizontal_accuracy(hacc)) {
+        refuse("RWY: GPS accuracy not available");
+        return false;
+    }
+    const float hacc_max = start_xtrk_max * RWY_GPS_ACC_FRAC;
+    if (hacc > hacc_max) {
+        refuse("RWY: GPS accuracy %.2fm > %.2fm", (double)hacc, (double)hacc_max);
+        return false;
     }
 
     float xtrk, along;
@@ -568,11 +580,15 @@ void RunwayTakeoff::update_monitor()
     if (!active()) {
         return;
     }
-    // before the roll: armed, with AUTO holding the takeoff
-    const bool holding = !state.roll_started;
-    if (holding && !hal.util->get_soft_armed()) {
+    if (!hal.util->get_soft_armed()) {
+        // disarmed: this takeoff attempt is over. Stops the abort
+        // checks, which fired while the aircraft was pushed back
+        state.roll_started = false;
+        state.hold_count = 0;
         return;
     }
+    // before the roll, with AUTO holding the takeoff
+    const bool holding = !state.roll_started;
 
     const uint32_t now_ms = AP_HAL::millis();
     float xtrk, along;
@@ -955,8 +971,10 @@ float RunwayTakeoff::heading_error_deg() const
 
 float RunwayTakeoff::speed_for_v1() const
 {
+    // only a measured airspeed: the synthetic estimate used without a
+    // sensor was off by up to 1.8 m/s on the roll
     float aspd;
-    if (plane.ahrs.airspeed_EAS(aspd)) {
+    if (plane.ahrs.using_airspeed_sensor() && plane.ahrs.airspeed_EAS(aspd)) {
         return aspd;
     }
     return plane.gps.ground_speed();
