@@ -161,6 +161,8 @@ private:
         bool abort_hold_hdg;   // latched: hold the runway direction for the rest of the stop
         float brake_soft;      // brake applied, rate limited, for steer_soft
         float steer_soft;      // steering softening factor applied, RWY_BRK_GAIN to 1
+        uint32_t blend_start_ms; // when the aircraft started rolling, 0 before
+        float blend;           // RWY_BLEND fade-in factor applied, 0 to 1
     } state;
 
     // causes of deceleration, logged in RWYT.DC

@@ -26,6 +26,10 @@
 // below this ground speed after an abort the steering is centred
 #define RWY_ABORT_CENTRE_SPEED 2.0f
 
+// ground speed at which the aircraft counts as rolling and the
+// RWY_BLEND fade-in starts
+#define RWY_BLEND_START_SPEED 1.0f
+
 // number of consecutive navigation cycles (10Hz) an abort condition
 // must be present before the abort is triggered
 #define RWY_ABORT_DEBOUNCE_COUNT 3
@@ -136,7 +140,7 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: BLEND
     // @DisplayName: Steering fade-in time
-    // @Description: Time from the start of the roll over which the runway steering correction is faded in, to avoid a step in the steering demand.
+    // @Description: Time over which the runway steering correction is faded in, to avoid a step in the steering demand. The fade-in starts when the aircraft starts rolling (1 m/s ground speed), not when the takeoff is triggered.
     // @Units: s
     // @Range: 0 10
     // @User: Advanced
@@ -356,6 +360,8 @@ void RunwayTakeoff::launch_started()
     state.past_rotate = false;
     state.abort_count = 0;
     state.max_abs_xtrk = 0;
+    state.blend_start_ms = 0;
+    state.blend = 0;
     state.launch_ms = AP_HAL::millis();
     state.last_report_ms = state.launch_ms;
 
@@ -502,11 +508,21 @@ void RunwayTakeoff::ground_steering_error(int32_t &bearing_error_cd)
         const float xt_corr = constrain_float(-degrees(atan2f(xtrk, look)), -cap, cap);
         err = wrap_180(state.bearing_deg + xt_corr - plane.ahrs.get_yaw_deg());
 
-        // fade in from the start of the roll
-        if (is_positive(blend_time)) {
-            const float t = (AP_HAL::millis() - state.launch_ms) * 0.001f;
-            err *= constrain_float(t / blend_time, 0, 1);
+        // fade in once the aircraft is actually rolling, not from when
+        // the takeoff was triggered
+        const uint32_t now_ms = AP_HAL::millis();
+        if (state.blend_start_ms == 0 && gspd >= RWY_BLEND_START_SPEED) {
+            state.blend_start_ms = MAX(now_ms, 1U);
         }
+        float blend = 0;
+        if (state.blend_start_ms != 0) {
+            blend = 1;
+            if (is_positive(blend_time)) {
+                blend = constrain_float((now_ms - state.blend_start_ms) * 0.001f / blend_time, 0, 1);
+            }
+        }
+        state.blend = blend;
+        err *= blend;
     }
 
     err = constrain_float(err, -cap, cap);
@@ -900,7 +916,8 @@ void RunwayTakeoff::write_log(float xtrk, float along, float hdg_err, float spd)
     // @Field: DC: decelerating, and why: bit 0 brakes, bit 1 throttle closed or engine off, bit 2 abort
     // @Field: BF: brake applied, 0 to 1
     // @Field: SF: steering softening factor applied under braking, 1 is none
-    AP::logger().WriteStreaming("RWYT", "TimeUS,XT,AT,HE,Spd,SE,V1,Abt,GP,WL,LA,DC,BF,SF", "smmdnd----m---", "F0000000000000", "QfffffBBBffBff",
+    // @Field: Bl: steering fade-in (RWY_BLEND) factor applied, 0 to 1
+    AP::logger().WriteStreaming("RWYT", "TimeUS,XT,AT,HE,Spd,SE,V1,Abt,GP,WL,LA,DC,BF,SF,Bl", "smmdnd----m----", "F00000000000000", "QfffffBBBffBfff",
                                 AP_HAL::micros64(),
                                 (double)xtrk,
                                 (double)along,
@@ -914,7 +931,8 @@ void RunwayTakeoff::write_log(float xtrk, float along, float hdg_err, float spd)
                                 (double)state.last_look,
                                 state.decel_flags,
                                 (double)state.brake_frac,
-                                (double)state.steer_soft);
+                                (double)state.steer_soft,
+                                (double)state.blend);
 #endif
 
     // live values for GCS graphing at 5Hz
