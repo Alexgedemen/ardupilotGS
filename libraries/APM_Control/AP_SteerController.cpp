@@ -69,7 +69,7 @@ const AP_Param::GroupInfo AP_SteerController::var_info[] = {
 
 	// @Param: MINSPD
 	// @DisplayName: Minimum speed
-	// @Description: This is the minimum assumed ground speed in meters/second for steering. Having a minimum speed prevents oscillations when the vehicle first starts moving. The vehicle can still drive slower than this limit, but the steering calculations will be done based on this minimum speed.
+	// @Description: This is the minimum assumed ground speed in meters/second for steering. Having a minimum speed prevents oscillations when the vehicle first starts moving. The vehicle can still drive slower than this limit, but the steering calculations will be done based on this minimum speed. Below this speed the steering integrator is held at zero.
 	// @Range: 0 5
 	// @Increment: 0.1
 	// @Units: m/s
@@ -132,7 +132,10 @@ int32_t AP_SteerController::get_steering_out_rate(float desired_rate)
 
     AP_AHRS &_ahrs = AP::ahrs();
 
-    float speed = _ahrs.groundspeed();
+    // the measured speed decides whether the integrator runs, so test
+    // it before the minimum speed is applied below
+    const float measured_speed = _ahrs.groundspeed();
+    float speed = measured_speed;
     if (speed < _minspeed) {
         // assume a minimum speed. This stops oscillations when first starting to move
         speed = _minspeed;
@@ -162,8 +165,9 @@ int32_t AP_SteerController::get_steering_out_rate(float desired_rate)
 	float delta_time    = (float)dt * 0.001f;
 	
 	// Multiply yaw rate error by _ki_rate and integrate
-	// Don't integrate if in stabilize mode as the integrator will wind up against the pilots inputs
-	if (ki_rate > 0 && speed >= _minspeed) {
+	// Don't integrate below the minimum speed, so the integrator
+	// can't wind up while stationary, and returns to zero on stopping
+	if (ki_rate > 0 && measured_speed >= _minspeed) {
 		// only integrate if gain and time step are positive.
 		if (dt > 0) {
 		    float integrator_delta = rate_error * ki_rate * delta_time * scaler;
