@@ -10,6 +10,11 @@ usage:
 
 scenarios: stock, track, refuse, nodef, nowp, abort, abort_steer, past_v1,
            mission, all (default)
+           wl, field, abort_return, abort_soft, brake_slip, brake_free,
+           brake_time, gps_acc, abort_hdg, abort_hdg_return (not in all)
+
+After each scenario the newest dataflash log is summarised (RWYT, ATT,
+PIDS, GPS). RWY_BINARY overrides the SITL binary, for A/B runs.
 
 The runway is synthetic, heading RWY_HDG_DEG true near CMAC. Point A (the
 TAKEOFF item) is the threshold, point B (the next waypoint) is B_DIST_M
@@ -28,7 +33,7 @@ from pymavlink import mavutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
-BINARY = os.path.join(ROOT, "build", "sitl", "bin", "arduplane")
+BINARY = os.environ.get("RWY_BINARY", os.path.join(ROOT, "build", "sitl", "bin", "arduplane"))
 
 THRESH_LAT = -35.363261
 THRESH_LON = 149.165230
@@ -258,10 +263,10 @@ class Sim:
                                        0, 21196, 0, 0, 0, 0, 0)
         self.pump(1.5)
 
-    def start_engine(self):
+    def start_engine(self, brake_pwm=1100):
         # no engine RC switch: start with MAV_CMD_DO_ENGINE_CONTROL,
         # allowing a start while disarmed (flags bit 0)
-        self.rc_override({9: 1100, 3: 1000})
+        self.rc_override({9: brake_pwm, 3: 1000})
         self.mav.mav.command_long_send(1, 1, mavutil.mavlink.MAV_CMD_DO_ENGINE_CONTROL, 0,
                                        1, 0, 0, 1, 0, 0, 0)
         self.pump(8)
@@ -292,7 +297,116 @@ class Sim:
         return max(rates) if rates else None
 
 
-def scenario(name, params, start_offset, yaw_err, run_s, extra=None, ref=True, b_cmd=None, items_extra=None):
+def newest_log(workdir):
+    logdir = os.path.join(workdir, "logs")
+    if not os.path.isdir(logdir):
+        return None
+    bins = [os.path.join(logdir, f) for f in os.listdir(logdir) if f.upper().endswith(".BIN")]
+    return max(bins, key=os.path.getmtime) if bins else None
+
+
+def log_report(path, minspd):
+    """summarise the RWYT, ATT, PIDS and GPS messages of a dataflash log"""
+    from pymavlink import DFReader
+    if path is None:
+        print("  log: none")
+        return {}
+    log = DFReader.DFReader_binary(path)
+    rwyt, att, pids, gps = [], [], [], []
+    while True:
+        m = log.recv_match(type=["RWYT", "ATT", "PIDS", "GPS"])
+        if m is None:
+            break
+        t = m.get_type()
+        if t == "RWYT":
+            rwyt.append(m)
+        elif t == "ATT":
+            att.append((m.TimeUS, m.DesRoll, m.Roll))
+        elif t == "PIDS":
+            pids.append((m.TimeUS, m.I))
+        elif t == "GPS" and getattr(m, "I", 0) == 0:
+            gps.append((m.TimeUS, m.Spd))
+
+    def gps_spd(tus):
+        best = None
+        for (t, s) in gps:
+            if t > tus:
+                break
+            best = s
+        return best
+
+    rep = {}
+    # change 1: steering integrator below STEER2SRV_MINSPD
+    gi = 0
+    slow_i = []
+    for (t, i) in pids:
+        while gi + 1 < len(gps) and gps[gi + 1][0] <= t:
+            gi += 1
+        if gps and gps[gi][1] < minspd:
+            slow_i.append(abs(i))
+    if pids:
+        rep["max_I_below_minspd"] = max(slow_i) if slow_i else None
+        rep["max_I"] = max(abs(i) for (_, i) in pids)
+        print("  log PIDS: max |I| %.3f, max |I| below MINSPD %s" % (
+            rep["max_I"], "%.3f" % rep["max_I_below_minspd"] if slow_i else "-"))
+    if not rwyt:
+        print("  log RWYT: none")
+        return rep
+    fields = rwyt[0].get_fieldnames()
+    has = set(fields)
+    # change 3: desired roll in the ground phase
+    if "GP" in has:
+        gp_t = [(r.TimeUS, r.GP, r.WL) for r in rwyt]
+        ri = 0
+        des_gp, des_hand = [], []
+        for (t, des, roll) in att:
+            while ri + 1 < len(gp_t) and gp_t[ri + 1][0] <= t:
+                ri += 1
+            if gp_t[ri][0] > t or t - gp_t[ri][0] > 200000:
+                continue
+            if gp_t[ri][1]:
+                des_gp.append((abs(des), abs(roll)))
+            elif gp_t[ri][2] < 1:
+                des_hand.append(abs(des))
+        end_gp = [r.TimeUS for i, r in enumerate(rwyt[1:]) if rwyt[i].GP and not r.GP]
+        wl_full = [r.TimeUS for i, r in enumerate(rwyt[1:]) if rwyt[i].WL < 1 and r.WL >= 1]
+        if des_gp:
+            print("  log ground phase: %d ATT samples, max |DesRoll| %.2f, max |Roll| %.2f deg" % (
+                len(des_gp), max(d for d, _ in des_gp), max(r for _, r in des_gp)))
+            rep["max_desroll_gp"] = max(d for d, _ in des_gp)
+        if end_gp:
+            msg = "  log ground phase ended at %.1f s" % (end_gp[0] * 1e-6)
+            if wl_full:
+                msg += ", WL reached 1 after %.2f s" % ((wl_full[0] - end_gp[0]) * 1e-6)
+            if des_hand:
+                msg += ", max |DesRoll| during hand-back %.2f deg" % max(des_hand)
+            print(msg)
+    else:
+        # older RWYT: desired roll while rolling on the ground
+        on_ground = [abs(d) for (t, d, _) in att if rwyt[0].TimeUS <= t <= rwyt[-1].TimeUS]
+        if on_ground:
+            print("  log takeoff: max |DesRoll| %.2f deg over the logged takeoff" % max(on_ground))
+    if "LA" in has:
+        print("  log LA: %.1f to %.1f m" % (min(r.LA for r in rwyt), max(r.LA for r in rwyt)))
+    if "DC" in has:
+        flags = 0
+        for r in rwyt:
+            flags |= r.DC
+        print("  log DC seen: 0x%x, max BF %.2f, min SF %.2f, max BT %.1f s" % (
+            flags, max(r.BF for r in rwyt),
+            min(r.SF for r in rwyt) if "SF" in has else 1,
+            max(r.BT for r in rwyt) if "BT" in has else 0))
+    if "Bl" in has:
+        started = [r for r in rwyt if r.Bl > 0]
+        if started:
+            s = gps_spd(started[0].TimeUS)
+            print("  log blend: first Bl>0 at GPS speed %s m/s" % ("%.2f" % s if s is not None else "-"))
+            rep["blend_start_spd"] = s
+    return rep
+
+
+def scenario(name, params, start_offset, yaw_err, run_s, extra=None, ref=True, b_cmd=None, items_extra=None,
+             hold_brake=False):
     print("\n=== %s: start offset %.1fm right, yaw err %+.1f deg ===" % (name, start_offset, yaw_err))
     sim = Sim(start_offset, yaw_err)
     try:
@@ -313,7 +427,7 @@ def scenario(name, params, start_offset, yaw_err, run_s, extra=None, ref=True, b
         sim.arm()
         t_roll = time.time()
         # SITL only drives the starter when armed, so start after arming
-        sim.start_engine()
+        sim.start_engine(1900 if hold_brake else 1100)
         if extra is not None:
             extra(sim)
         else:
@@ -340,6 +454,9 @@ def scenario(name, params, start_offset, yaw_err, run_s, extra=None, ref=True, b
             print("  xt when passing 30m AGL: %.1fm" % air[0][1])
         if res["max_yaw_rate_roll"] is not None:
             print("  max |yaw rate| in first 25 s of roll: %.1f deg/s" % res["max_yaw_rate_roll"])
+        sim.close()
+        minspd = dict(BASE_PARAMS, **params).get("STEER2SRV_MINSPD", 1)
+        res["log"] = log_report(newest_log(sim.workdir), minspd)
         return res
     finally:
         sim.close()
@@ -389,7 +506,7 @@ def abort_steer_extra(sim):
         if not kicked and spd > 10:
             kicked = True
             # about 1 s of sim time of right rudder
-            sim.rc_override({4: 1650})
+            sim.rc_override({4: int(os.environ.get("RWY_KICK_PWM", "1650"))})
             sim.pump(1.0 / float(os.environ.get("RWY_SPEEDUP", "5")))
             sim.rc_override({4: 1500})
         sim.rc_override({})
@@ -406,6 +523,53 @@ def abort_steer_extra(sim):
         print("  after abort: heading error extremes %+.1f / %+.1f deg, final %+.1f" %
               (min(yaws), max(yaws), yaws[-1]))
     report_brake_ramp(sim)
+
+
+def brake_hold_extra(sim):
+    """wait on the brake hold (brakes as set at engine start) until the
+    takeoff triggers or aborts. The sim has no brakes, so ICE idle
+    throttle makes the aircraft creep as if the brakes had released"""
+    t0 = time.time()
+    while time.time() - t0 < 40 and not any(("ABORT" in t or "Triggered" in t) for t in sim.texts):
+        sim.rc_override({})
+        sim.pump(0.3)
+    sim.run_takeoff(4)
+    spds = [p[3] for p in sim.track]
+    print("  max GPS ground speed seen %.2f m/s; aborted=%s triggered=%s" % (
+        max(spds) if spds else 0,
+        any("ABORT" in t for t in sim.texts), any("Triggered" in t for t in sim.texts)))
+
+
+def brake_time_test():
+    """brake operating time warning, disarmed: hold RC9 at full brake"""
+    print("\n=== brake operating time warning (disarmed, RWY_BRK_TMAX 20) ===")
+    sim = Sim(0.0, 0.0)
+    try:
+        sim.set_params(BASE_PARAMS)
+        sim.set_params(dict(RWY_PARAMS, RWY_BRK_TMAX=20))
+        speedup = float(os.environ.get("RWY_SPEEDUP", "5"))
+        sim.rc_override({9: 1900, 3: 1000})
+        t0 = time.time()
+        while time.time() - t0 < 32 / speedup + 3:
+            sim.rc_override({})
+            sim.pump(0.2)
+        warn = [t for t in sim.texts if "brakes on" in t]
+        print("  messages while held: %s" % warn)
+        # release and re-apply: the timer restarts, so no message for 10 s
+        sim.rc_override({9: 1100})
+        sim.pump(1)
+        n = len(sim.texts)
+        sim.rc_override({9: 1900})
+        t0 = time.time()
+        while time.time() - t0 < 5 / speedup:
+            sim.rc_override({})
+            sim.pump(0.2)
+        again = [t for t in sim.texts[n:] if "brakes on" in t]
+        print("  messages in the first 5 s after re-applying: %s" % again)
+        return {"stats": None, "texts": list(sim.texts), "airborne_xt": None, "final_alt": None,
+                "max_yaw_rate_roll": None}
+    finally:
+        sim.close()
 
 
 def mission_items_other_runway():
@@ -484,11 +648,60 @@ def main():
         p = dict(RWY_PARAMS, RWY_ABT_XTRK=3, RWY_V1=8, SERVO5_FUNCTION=0, KFF_RDDRMIX=0)
         results["past_v1"] = scenario("deviation after V1 continues", p, 0.0, 3.0, 45)
 
+    # scenarios for the November changes; run by name, not part of "all"
+    def named(n):
+        return n in want
+    if named("wl"):
+        p = dict(RWY_PARAMS, RWY_ENABLE=3, RWY_V1=13, TKOFF_THR_MAX=100)
+        results["wl"] = scenario("wings level on the ground", p, 2.0, 3.0, 45)
+    if named("wl_off"):
+        p = dict(RWY_PARAMS, RWY_V1=13, TKOFF_THR_MAX=100)
+        results["wl_off"] = scenario("wings level off (RWY_ENABLE 1)", p, 2.0, 3.0, 45)
+    if named("field"):
+        # field values from the brief, with a steering integrator
+        p = dict(RWY_PARAMS, RWY_ENABLE=3, RWY_V1=13, RWY_LOOK_MAX=50, RWY_BRK_GAIN=0.6,
+                 STEER2SRV_IREF=12, STEER2SRV_I=0.2, TKOFF_THR_MAX=100)
+        results["field"] = scenario("field settings", p, 2.0, 3.0, 45)
+    if named("abort_return"):
+        p = dict(RWY_PARAMS, RWY_ABT_XTRK=2, RWY_V1=13, RWY_LOOK_MAX=50)
+        results["abort_return"] = scenario("abort after a pilot kick, return to the line", p, 0.0, 0.0, 0,
+                                           extra=abort_steer_extra)
+    if named("abort_soft"):
+        p = dict(RWY_PARAMS, RWY_ABT_XTRK=2, RWY_V1=13, RWY_LOOK_MAX=50, RWY_BRK_GAIN=0.6,
+                 STEER2SRV_I=0.2, RWY_ENABLE=3)
+        results["abort_soft"] = scenario("abort after a pilot kick, field settings", p, 0.0, 0.0, 0,
+                                         extra=abort_steer_extra)
+    if named("abort_hdg") or named("abort_hdg_return"):
+        # a small kick and a tight heading limit: the abort fires near the
+        # line with a small heading error. Compare the stop with the runway
+        # direction held (RWY_LOOK_MAX 0) and with the return to the line
+        os.environ.setdefault("RWY_KICK_PWM", "1600")
+        p = dict(RWY_PARAMS, RWY_ABT_HDG=3, RWY_V1=13, STEER2SRV_I=0.2)
+        if named("abort_hdg"):
+            results["abort_hdg"] = scenario("heading abort, runway direction held", p, 0.0, 0.0, 0,
+                                            extra=abort_steer_extra)
+        if named("abort_hdg_return"):
+            results["abort_hdg_return"] = scenario("heading abort, return to the line", dict(p, RWY_LOOK_MAX=50),
+                                                   0.0, 0.0, 0, extra=abort_steer_extra)
+    if named("brake_slip"):
+        p = dict(RWY_PARAMS, TKOFF_THR_MINSPD=4, ICE_IDLE_PCT=25)
+        results["brake_slip"] = scenario("brakes on but not holding on the hold", p, 0.0, 0.0, 0,
+                                         extra=brake_hold_extra, hold_brake=True)
+    if named("brake_free"):
+        p = dict(RWY_PARAMS, TKOFF_THR_MINSPD=4, ICE_IDLE_PCT=25)
+        results["brake_free"] = scenario("brakes released on the hold (control)", p, 0.0, 0.0, 0,
+                                         extra=brake_hold_extra, hold_brake=False)
+    if named("brake_time"):
+        results["brake_time"] = brake_time_test()
+    if named("gps_acc"):
+        p = dict(RWY_PARAMS, SIM_GPS1_ACC=2.0)
+        results["gps_acc"] = scenario("GPS accuracy worse than half RWY_STRT_XTRK", p, 0.0, 0.0, 15)
+
     print("\n=== SUMMARY ===")
     for k, r in results.items():
         st = r["stats"]
         aborted = any("ABORT" in t for t in r["texts"])
-        refused = any("RWY: start" in t or "RWY: no runway" in t for t in r["texts"])
+        refused = any("RWY: start" in t or "RWY: no runway" in t or "RWY: GPS" in t for t in r["texts"])
         landed = any("Landed" in t or "Flare" in t for t in r["texts"])
         print("%-11s max|xt| roll %s  max yaw rate %s  xt@30m %s  final alt %s  aborted=%s refused=%s landed=%s" % (
             k,
