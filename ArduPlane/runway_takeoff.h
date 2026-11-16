@@ -120,6 +120,7 @@ private:
     AP_Float lookahead;        // s
     AP_Float brake_ramp;       // s
     AP_Float wl_fade;          // s
+    AP_Float look_max;         // m, 0 disables
 
     struct {
         Location point_a;      // TAKEOFF item: start of the runway line
@@ -147,6 +148,7 @@ private:
         bool past_rotate;      // rotate speed reached on this roll
         uint32_t ground_end_ms; // when the ground phase last ended, 0 while in it
         float wl_factor;       // roll limit hand-back, 0 (level) to 1 (stock)
+        float last_look;       // m, steering lookahead used, for logging
     } state;
 
     // geometry relative to the runway line. xtrk +ve = right of the
@@ -156,6 +158,7 @@ private:
     float speed_for_v1() const;
     bool abort_enabled() const;
     bool reached_rotate_speed() const;
+    float lookahead_m(float gspd) const;
     bool wow_available();
     void update_ground_phase();
 

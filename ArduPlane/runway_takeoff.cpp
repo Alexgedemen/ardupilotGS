@@ -152,6 +152,15 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("WL_FADE", 15, RunwayTakeoff, wl_fade, 1),
 
+    // @Param: LOOK_MAX
+    // @DisplayName: Steering lookahead limit
+    // @Description: If non-zero, the upper limit on the runway steering lookahead distance (RWY_LOOKAHEAD seconds of travel, minimum 10 m), so the cross-track correction keeps its authority at high speed. 0 means no limit.
+    // @Units: m
+    // @Range: 0 200
+    // @Increment: 1
+    // @User: Advanced
+    AP_GROUPINFO("LOOK_MAX", 16, RunwayTakeoff, look_max, 0),
+
     AP_GROUPEND
 };
 
@@ -435,7 +444,8 @@ void RunwayTakeoff::ground_steering_error(int32_t &bearing_error_cd)
     } else {
         float xtrk, along;
         get_line_errors(xtrk, along);
-        const float look = MAX(lookahead * gspd, RWY_MIN_LOOKAHEAD_M);
+        const float look = lookahead_m(gspd);
+        state.last_look = look;
         const float xt_corr = constrain_float(-degrees(atan2f(xtrk, look)), -cap, cap);
         err = wrap_180(state.bearing_deg + xt_corr - plane.ahrs.get_yaw_deg());
 
@@ -629,6 +639,20 @@ bool RunwayTakeoff::abort_enabled() const
 }
 
 /*
+  steering lookahead distance: RWY_LOOKAHEAD seconds of travel, at least
+  RWY_MIN_LOOKAHEAD_M, and no more than RWY_LOOK_MAX if that is set.
+  Staying time-based below the limit keeps the cross-track damping
+ */
+float RunwayTakeoff::lookahead_m(float gspd) const
+{
+    float look = MAX(lookahead * gspd, RWY_MIN_LOOKAHEAD_M);
+    if (is_positive(look_max)) {
+        look = MIN(look, MAX(look_max, RWY_MIN_LOOKAHEAD_M));
+    }
+    return look;
+}
+
+/*
   end of the ground phase by speed: TKOFF_ROTATE_SPD on the same speed
   the stock takeoff rotates on, or RWY_V1 if no rotate speed is set
  */
@@ -704,7 +728,8 @@ void RunwayTakeoff::write_log(float xtrk, float along, float hdg_err, float spd)
     // @Field: Abt: true once aborted
     // @Field: GP: true in the ground phase (on the runway, or aborted)
     // @Field: WL: roll limit hand-back factor applied, 0 wings held level to 1 stock limit
-    AP::logger().WriteStreaming("RWYT", "TimeUS,XT,AT,HE,Spd,SE,V1,Abt,GP,WL", "smmdnd----", "F000000000", "QfffffBBBf",
+    // @Field: LA: steering lookahead distance used
+    AP::logger().WriteStreaming("RWYT", "TimeUS,XT,AT,HE,Spd,SE,V1,Abt,GP,WL,LA", "smmdnd----m", "F0000000000", "QfffffBBBff",
                                 AP_HAL::micros64(),
                                 (double)xtrk,
                                 (double)along,
@@ -714,7 +739,8 @@ void RunwayTakeoff::write_log(float xtrk, float along, float hdg_err, float spd)
                                 uint8_t(state.past_v1),
                                 uint8_t(state.aborted),
                                 uint8_t(state.ground_phase),
-                                (double)state.wl_factor);
+                                (double)state.wl_factor,
+                                (double)state.last_look);
 #endif
 
     // live values for GCS graphing at 5Hz
