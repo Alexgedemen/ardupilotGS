@@ -444,10 +444,9 @@ void RunwayTakeoff::trigger_abort(const char *reason, float xtrk, float hdg_err,
     GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "RWY: ABORT %s xt %.1f he %.1f v %.1f",
                   reason, (double)xtrk, (double)hdg_err, (double)spd);
 
-    // the steering integrator holds the trim built up on the roll. Under
-    // braking the nosewheel is suddenly more effective, so start the
-    // stop from a clean integrator
-    plane.steerController.reset_I();
+    // the steering integrator is left alone: it holds the crosswind
+    // correction learned on the roll, which the stop still needs. It
+    // returns to zero below STEER2SRV_MINSPD
 
 #if AP_ICENGINE_ENABLED
     // ignition off
