@@ -64,6 +64,25 @@
 // its horizontal accuracy is within this fraction of RWY_STRT_XTRK
 #define RWY_GPS_ACC_FRAC 0.5f
 
+// brakes-not-holding check while AUTO holds the takeoff. The brakes
+// count as commanded on above this fraction of their travel
+#define RWY_HOLD_BRAKE_FRAC 0.5f
+// moving: GPS ground speed above this, and above this fraction of
+// TKOFF_THR_MINSPD when that is set
+#define RWY_HOLD_SPD_MAX 0.5f
+#define RWY_HOLD_SPD_FRAC 0.3f
+// accelerating: TECS longitudinal acceleration above this while the
+// GPS ground speed is above the floor, which rejects idle vibration
+#define RWY_HOLD_ACCEL 0.5f
+#define RWY_HOLD_ACCEL_MIN_SPD 0.2f
+// consecutive navigation cycles (10Hz) before the abort
+#define RWY_HOLD_DEBOUNCE_COUNT 5
+
+// brake operating time warning: lead time before RWY_BRK_TMAX (at most
+// half of it), and the repeat interval
+#define RWY_BRK_WARN_LEAD_S 30.0f
+#define RWY_BRK_WARN_INTERVAL_MS 10000U
+
 const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: ENABLE
@@ -125,7 +144,7 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: BRK_CHAN
     // @DisplayName: Wheel brake servo output
-    // @Description: Servo output number (1-based) driving the wheel brakes. On abort this output is held at RWY_BRK_PWM, overriding whatever function the output has (including RC passthrough). 0 disables brake control.
+    // @Description: Servo output number (1-based) driving the wheel brakes. On abort this output is held at RWY_BRK_PWM, overriding whatever function the output has (including RC passthrough). The output is also read, against its SERVOn_TRIM (brakes off) and RWY_BRK_PWM (full brake), to see how much brake is applied, for the steering, the brakes-not-holding check and the brake time warning. 0 disables brake control.
     // @Range: 0 32
     // @User: Advanced
     AP_GROUPINFO("BRK_CHAN", 9, RunwayTakeoff, brake_chan, 0),
@@ -195,6 +214,15 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
     // @Increment: 0.05
     // @User: Advanced
     AP_GROUPINFO("BRK_GAIN", 17, RunwayTakeoff, brk_gain, 1),
+
+    // @Param: BRK_TMAX
+    // @DisplayName: Brake operating time limit
+    // @Description: Assigned operating time of the wheel brakes. The time the brakes have been applied continuously (from the RWY_BRK_CHAN output, whatever drives it, armed or disarmed) is compared with this, and the GCS is warned from 30 s before it (half of it if shorter) every 10 s, with a critical message once it is reached, so the brakes can be released or the engine shut down before the brakes switch themselves off. Warning only: the brakes are not changed. 0 disables the warning.
+    // @Units: s
+    // @Range: 0 600
+    // @Increment: 1
+    // @User: Advanced
+    AP_GROUPINFO("BRK_TMAX", 18, RunwayTakeoff, brk_tmax, 90),
 
     AP_GROUPEND
 };
@@ -537,7 +565,12 @@ void RunwayTakeoff::ground_steering_error(int32_t &bearing_error_cd)
 
 void RunwayTakeoff::update_monitor()
 {
-    if (!active() || !state.roll_started) {
+    if (!active()) {
+        return;
+    }
+    // before the roll: armed, with AUTO holding the takeoff
+    const bool holding = !state.roll_started;
+    if (holding && !hal.util->get_soft_armed()) {
         return;
     }
 
@@ -550,6 +583,13 @@ void RunwayTakeoff::update_monitor()
     update_ground_phase();
     state.max_abs_xtrk = MAX(state.max_abs_xtrk, fabsf(xtrk));
     write_log(xtrk, along, hdg_err, spd);
+
+    if (holding) {
+        if (!state.aborted) {
+            check_brakes_holding(xtrk, hdg_err);
+        }
+        return;
+    }
 
     if (now_ms - state.last_report_ms >= RWY_REPORT_INTERVAL_MS) {
         state.last_report_ms = now_ms;
@@ -592,6 +632,39 @@ void RunwayTakeoff::update_monitor()
     }
     if (++state.abort_count >= RWY_ABORT_DEBOUNCE_COUNT) {
         trigger_abort(reason, xtrk, hdg_err, spd);
+    }
+}
+
+/*
+  while AUTO holds the takeoff with the brakes commanded on and the
+  engine running, abort if the aircraft starts to move or accelerate:
+  the brakes are not holding, and TKOFF_THR_MINSPD would otherwise start
+  the takeoff at full power
+ */
+void RunwayTakeoff::check_brakes_holding(float xtrk, float hdg_err)
+{
+    // only on the ground with the throttle held back for the takeoff,
+    // never if a mission restarts at the TAKEOFF item in flight
+    if (!plane.throttle_suppressed || plane.is_flying() ||
+        state.brake_frac < RWY_HOLD_BRAKE_FRAC || !engine_running()) {
+        state.hold_count = 0;
+        return;
+    }
+
+    const float gspd = plane.gps.ground_speed();
+    float spd_lim = RWY_HOLD_SPD_MAX;
+    if (is_positive(plane.g.takeoff_throttle_min_speed)) {
+        spd_lim = MIN(spd_lim, plane.g.takeoff_throttle_min_speed * RWY_HOLD_SPD_FRAC);
+    }
+    const bool moving = gspd > spd_lim;
+    const bool accelerating = gspd > RWY_HOLD_ACCEL_MIN_SPD &&
+                              plane.TECS_controller.get_VXdot() > RWY_HOLD_ACCEL;
+    if (!moving && !accelerating) {
+        state.hold_count = 0;
+        return;
+    }
+    if (++state.hold_count >= RWY_HOLD_DEBOUNCE_COUNT) {
+        trigger_abort("brakes slip", xtrk, hdg_err, gspd);
     }
 }
 
@@ -705,10 +778,27 @@ void RunwayTakeoff::update_brakes()
         state.decel_frac = 0;
         state.brake_soft = 0;
         state.steer_soft = 1;
+        state.brake_on_ms = 0;
+        state.brake_time_s = 0;
+        state.brake_warn_level = 0;
         return;
     }
 
     state.brake_frac = brake_fraction();
+
+    // continuous brake time, armed or disarmed, in any mode
+    const uint32_t now_ms = AP_HAL::millis();
+    if (state.brake_frac >= RWY_BRAKE_ON_FRAC) {
+        if (state.brake_on_ms == 0) {
+            state.brake_on_ms = MAX(now_ms, 1U);
+        }
+        state.brake_time_s = (now_ms - state.brake_on_ms) * 0.001f;
+    } else {
+        state.brake_on_ms = 0;
+        state.brake_time_s = 0;
+        state.brake_warn_level = 0;
+    }
+    check_brake_time(now_ms);
 
     // steering softening under braking. The brake value used follows
     // the output at a limited rate, so there is no step in the steering
@@ -767,6 +857,61 @@ float RunwayTakeoff::brake_fraction() const
         return 0;
     }
     return constrain_float((pwm - trim) / span, 0, 1);
+}
+
+/*
+  warn before the brakes reach their assigned operating time
+  (RWY_BRK_TMAX), so they can be released, or the engine shut down,
+  before the brakes switch themselves off. 30 s gives three warnings
+  before a 90 s limit: time to notice, to shut an engine down and
+  confirm it has stopped if the aircraft must not be left unbraked
+  with it running, and then release. Warning only
+ */
+void RunwayTakeoff::check_brake_time(uint32_t now_ms)
+{
+    if (!is_positive(brk_tmax) || state.brake_on_ms == 0) {
+        return;
+    }
+    const float t = state.brake_time_s;
+    const float lead = MIN(RWY_BRK_WARN_LEAD_S, brk_tmax * 0.5f);
+    uint8_t level = 0;
+    if (t >= brk_tmax) {
+        level = 2;
+    } else if (t >= brk_tmax - lead) {
+        level = 1;
+    }
+    if (level == 0) {
+        return;
+    }
+    if (level <= state.brake_warn_level &&
+        now_ms - state.last_brake_warn_ms < RWY_BRK_WARN_INTERVAL_MS) {
+        return;
+    }
+    state.brake_warn_level = level;
+    state.last_brake_warn_ms = now_ms;
+    if (level == 2) {
+        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "RWY: brakes on %.0fs, %.0fs limit reached",
+                      (double)t, (double)brk_tmax.get());
+    } else {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "RWY: brakes on %.0fs of %.0fs, release or shut down",
+                      (double)t, (double)brk_tmax.get());
+    }
+}
+
+// true if the engine is running, for the brakes-not-holding check
+bool RunwayTakeoff::engine_running() const
+{
+    if (SRV_Channels::get_emergency_stop()) {
+        return false;
+    }
+#if AP_ICENGINE_ENABLED
+    const AP_ICEngine::ICE_State ice = plane.g2.ice_control.get_state();
+    if (ice != AP_ICEngine::ICE_DISABLED) {
+        return ice == AP_ICEngine::ICE_RUNNING;
+    }
+#endif
+    // no ICE controller: a motor that is being driven
+    return SRV_Channels::get_output_scaled(SRV_Channel::k_throttle) > 0;
 }
 
 bool RunwayTakeoff::throttle_closed_or_engine_off() const
@@ -917,7 +1062,8 @@ void RunwayTakeoff::write_log(float xtrk, float along, float hdg_err, float spd)
     // @Field: BF: brake applied, 0 to 1
     // @Field: SF: steering softening factor applied under braking, 1 is none
     // @Field: Bl: steering fade-in (RWY_BLEND) factor applied, 0 to 1
-    AP::logger().WriteStreaming("RWYT", "TimeUS,XT,AT,HE,Spd,SE,V1,Abt,GP,WL,LA,DC,BF,SF,Bl", "smmdnd----m----", "F00000000000000", "QfffffBBBffBfff",
+    // @Field: BT: time the brakes have been applied continuously
+    AP::logger().WriteStreaming("RWYT", "TimeUS,XT,AT,HE,Spd,SE,V1,Abt,GP,WL,LA,DC,BF,SF,Bl,BT", "smmdnd----m----s", "F000000000000000", "QfffffBBBffBffff",
                                 AP_HAL::micros64(),
                                 (double)xtrk,
                                 (double)along,
@@ -932,7 +1078,8 @@ void RunwayTakeoff::write_log(float xtrk, float along, float hdg_err, float spd)
                                 state.decel_flags,
                                 (double)state.brake_frac,
                                 (double)state.steer_soft,
-                                (double)state.blend);
+                                (double)state.blend,
+                                (double)state.brake_time_s);
 #endif
 
     // live values for GCS graphing at 5Hz

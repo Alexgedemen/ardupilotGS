@@ -24,6 +24,10 @@
   or the GPS accuracy is poor, and the brakes are ramped to full over
   RWY_BRK_RAMP.
 
+  While AUTO holds the takeoff, the takeoff is aborted if the aircraft
+  moves with the brakes on and the engine running, and the GCS is warned
+  before the brakes reach their operating time limit (RWY_BRK_TMAX).
+
   RWY_ENABLE bit 1 holds the wings level while on the runway, including
   during an abort, and hands back to the stock roll limit over
   RWY_WL_FADE once rotate speed is reached.
@@ -125,6 +129,7 @@ private:
     AP_Float wl_fade;          // s
     AP_Float look_max;         // m, 0 disables
     AP_Float brk_gain;         // steering gain at full brake, 1 disables
+    AP_Float brk_tmax;         // s, brake operating time warning, 0 disables
 
     struct {
         Location point_a;      // TAKEOFF item: start of the runway line
@@ -163,6 +168,11 @@ private:
         float steer_soft;      // steering softening factor applied, RWY_BRK_GAIN to 1
         uint32_t blend_start_ms; // when the aircraft started rolling, 0 before
         float blend;           // RWY_BLEND fade-in factor applied, 0 to 1
+        uint8_t hold_count;    // consecutive cycles moving on the brake hold
+        uint32_t brake_on_ms;  // when the brakes were applied, 0 if released
+        float brake_time_s;    // continuous brake time
+        uint8_t brake_warn_level; // 0 none, 1 warning, 2 limit reached
+        uint32_t last_brake_warn_ms;
     } state;
 
     // causes of deceleration, logged in RWYT.DC
@@ -184,6 +194,9 @@ private:
     float brake_fraction() const;
     bool throttle_closed_or_engine_off() const;
     bool gps_position_ok() const;
+    void check_brakes_holding(float xtrk, float hdg_err);
+    void check_brake_time(uint32_t now_ms);
+    bool engine_running() const;
     bool wow_available();
     void update_ground_phase();
 
