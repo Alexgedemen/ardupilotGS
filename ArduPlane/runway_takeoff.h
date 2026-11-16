@@ -17,9 +17,12 @@
   after liftoff the roll demand follows the extended centreline until
   the takeoff altitude is reached.
 
-  After an abort the steering stops chasing the line and holds the
-  runway direction (straight stop), and the brakes are ramped to full
-  over RWY_BRK_RAMP.
+  While decelerating (brakes, throttle closed or engine off, abort) the
+  lookahead moves smoothly to RWY_LOOK_MAX. After an abort the steering
+  returns gently to the centreline with that lookahead and a reduced
+  correction limit, or holds the runway direction if RWY_LOOK_MAX is 0
+  or the GPS accuracy is poor, and the brakes are ramped to full over
+  RWY_BRK_RAMP.
 
   RWY_ENABLE bit 1 holds the wings level while on the runway, including
   during an abort, and hands back to the stock roll limit over
@@ -149,7 +152,20 @@ private:
         uint32_t ground_end_ms; // when the ground phase last ended, 0 while in it
         float wl_factor;       // roll limit hand-back, 0 (level) to 1 (stock)
         float last_look;       // m, steering lookahead used, for logging
+        float brake_frac;      // brake applied, 0 to 1
+        uint16_t brake_out_pwm; // abort brake override last written, 0 if none
+        uint8_t decel_flags;   // DecelFlag bits
+        float decel_frac;      // 0 normal lookahead to 1 RWY_LOOK_MAX
+        uint32_t last_brake_us;
+        bool abort_hold_hdg;   // latched: hold the runway direction for the rest of the stop
     } state;
+
+    // causes of deceleration, logged in RWYT.DC
+    enum class DecelFlag : uint8_t {
+        BRAKES   = (1U << 0),
+        THROTTLE = (1U << 1),  // throttle closed or engine off
+        ABORT    = (1U << 2),
+    };
 
     // geometry relative to the runway line. xtrk +ve = right of the
     // centreline looking from A to B, along = metres past A towards B
@@ -159,6 +175,10 @@ private:
     bool abort_enabled() const;
     bool reached_rotate_speed() const;
     float lookahead_m(float gspd) const;
+    void update_brakes();
+    float brake_fraction() const;
+    bool throttle_closed_or_engine_off() const;
+    bool gps_position_ok() const;
     bool wow_available();
     void update_ground_phase();
 

@@ -37,6 +37,25 @@
 #define RWY_REPORT_INTERVAL_MS 2000U
 #define RWY_REFUSE_MSG_INTERVAL_MS 3000U
 
+// brake output, as a fraction of the way from SERVOn_TRIM to
+// RWY_BRK_PWM, above which the brakes count as applied
+#define RWY_BRAKE_ON_FRAC 0.1f
+
+// throttle output at or below which the throttle counts as closed
+#define RWY_THR_CLOSED_PCT 10.0f
+
+// time for the steering lookahead to move fully between its normal
+// value and RWY_LOOK_MAX when deceleration starts or stops
+#define RWY_DECEL_LOOK_TIME_S 1.0f
+
+// fraction of RWY_MAX_CORR allowed for the return to the centreline
+// after an abort
+#define RWY_ABORT_CORR_FRAC 0.5f
+
+// the GPS position is trusted for steering and the start check when
+// its horizontal accuracy is within this fraction of RWY_STRT_XTRK
+#define RWY_GPS_ACC_FRAC 0.5f
+
 const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: ENABLE
@@ -420,8 +439,10 @@ int32_t RunwayTakeoff::ground_roll_limit_cd(int32_t stock_limit_cd)
 /*
   ground steering law. Aim at a point on the centreline a lookahead
   distance ahead, cap the correction, and fade it in from the start of
-  the roll. After an abort, hold the runway direction instead of
-  chasing the line, and centre the steering once nearly stopped.
+  the roll. While decelerating the lookahead moves to RWY_LOOK_MAX.
+  After an abort, steer back towards the centreline with a smaller
+  correction (or hold the runway direction if RWY_LOOK_MAX is 0 or the
+  GPS can't be trusted), and centre the steering once nearly stopped.
   Result is a heading error (desired - current), centidegrees.
  */
 void RunwayTakeoff::ground_steering_error(int32_t &bearing_error_cd)
@@ -433,19 +454,38 @@ void RunwayTakeoff::ground_steering_error(int32_t &bearing_error_cd)
 
     const float cap = constrain_float(max_corr, 1, 45);
     const float gspd = plane.ahrs.groundspeed();
-    float err;
+    float xtrk, along;
+    get_line_errors(xtrk, along);
 
+    float look = lookahead_m(gspd);
+    if (is_positive(look_max)) {
+        // while decelerating, move (at a limited rate) to the longest
+        // lookahead, for gentle cross-track correction
+        look += (MAX(look_max, RWY_MIN_LOOKAHEAD_M) - look) * state.decel_frac;
+    }
+    state.last_look = look;
+
+    float err;
     if (state.aborted) {
+        if (!is_positive(look_max) || !gps_position_ok()) {
+            // no line to return to without RWY_LOOK_MAX, or once the
+            // position can't be trusted: hold the runway direction for
+            // the rest of the stop, so a position jump can't steer us
+            state.abort_hold_hdg = true;
+        }
         if (gspd < RWY_ABORT_CENTRE_SPEED) {
             err = 0;
-        } else {
+        } else if (state.abort_hold_hdg) {
             err = wrap_180(state.bearing_deg - plane.ahrs.get_yaw_deg());
+        } else {
+            // steer back towards the centreline with a reduced
+            // correction limit. The correction depends only on the
+            // current offset, so nothing winds up during the stop
+            const float abort_cap = cap * RWY_ABORT_CORR_FRAC;
+            const float xt_corr = constrain_float(-degrees(atan2f(xtrk, look)), -abort_cap, abort_cap);
+            err = wrap_180(state.bearing_deg + xt_corr - plane.ahrs.get_yaw_deg());
         }
     } else {
-        float xtrk, along;
-        get_line_errors(xtrk, along);
-        const float look = lookahead_m(gspd);
-        state.last_look = look;
         const float xt_corr = constrain_float(-degrees(atan2f(xtrk, look)), -cap, cap);
         err = wrap_180(state.bearing_deg + xt_corr - plane.ahrs.get_yaw_deg());
 
@@ -561,6 +601,8 @@ void RunwayTakeoff::trigger_abort(const char *reason, float xtrk, float hdg_err,
         // ramp from whatever the brake output was at the abort
         state.brake_start_pwm = hal.rcout->read(brake_chan - 1);
     }
+    state.brake_out_pwm = 0;
+    state.abort_hold_hdg = false;
 }
 
 /*
@@ -569,6 +611,8 @@ void RunwayTakeoff::trigger_abort(const char *reason, float xtrk, float hdg_err,
  */
 void RunwayTakeoff::update_outputs()
 {
+    update_brakes();
+
     if (!state.aborted) {
         return;
     }
@@ -581,6 +625,7 @@ void RunwayTakeoff::update_outputs()
             pwm = uint16_t(state.brake_start_pwm + (brake_pwm - state.brake_start_pwm) * frac);
         }
         hal.rcout->write(brake_chan - 1, pwm);
+        state.brake_out_pwm = pwm;
     }
 
     if (hal.util->get_soft_armed()) {
@@ -606,6 +651,102 @@ void RunwayTakeoff::update_outputs()
         state.we_set_estop = false;
     }
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: abort cleared, brakes released");
+}
+
+/*
+  brake output and deceleration state, run every loop. Deceleration is
+  taken from the commanded inputs (brakes, throttle closed or engine
+  off, abort) rather than measured, so it is known at once and is not
+  fooled by runway bumps, slope or gusts
+ */
+void RunwayTakeoff::update_brakes()
+{
+    const uint32_t now_us = AP_HAL::micros();
+    const float dt = constrain_float((now_us - state.last_brake_us) * 1.0e-6f, 0, 0.1f);
+    state.last_brake_us = now_us;
+
+    if (!enabled()) {
+        state.brake_frac = 0;
+        state.decel_flags = 0;
+        state.decel_frac = 0;
+        return;
+    }
+
+    state.brake_frac = brake_fraction();
+
+    uint8_t flags = 0;
+    if (state.brake_frac >= RWY_BRAKE_ON_FRAC) {
+        flags |= uint8_t(DecelFlag::BRAKES);
+    }
+    if (throttle_closed_or_engine_off()) {
+        flags |= uint8_t(DecelFlag::THROTTLE);
+    }
+    if (state.aborted) {
+        flags |= uint8_t(DecelFlag::ABORT);
+    }
+    state.decel_flags = flags;
+
+    if (!(state.roll_started || state.aborted)) {
+        // the runway steering is not running
+        state.decel_frac = 0;
+    } else {
+        // rate limited, so a brake tap gives no step in the steering
+        const float target = flags != 0 ? 1 : 0;
+        const float step = dt / RWY_DECEL_LOOK_TIME_S;
+        state.decel_frac += constrain_float(target - state.decel_frac, -step, step);
+    }
+}
+
+/*
+  brake applied, 0 to 1, from the brake output against its SERVOn_TRIM
+  and RWY_BRK_PWM. Covers whatever drives the output: RC passthrough
+  or the abort override
+ */
+float RunwayTakeoff::brake_fraction() const
+{
+    if (brake_chan <= 0 || brake_chan > NUM_SERVO_CHANNELS) {
+        return 0;
+    }
+    const SRV_Channel *c = SRV_Channels::srv_channel(brake_chan - 1);
+    if (c == nullptr) {
+        return 0;
+    }
+    uint16_t pwm = 0;
+    if (state.aborted && state.brake_out_pwm != 0) {
+        // the abort override is written straight to the output
+        pwm = state.brake_out_pwm;
+    } else if (!SRV_Channels::get_output_pwm_chan(brake_chan - 1, pwm)) {
+        return 0;
+    }
+    const float trim = c->get_trim();
+    const float span = brake_pwm - trim;
+    if (pwm == 0 || fabsf(span) < 1) {
+        return 0;
+    }
+    return constrain_float((pwm - trim) / span, 0, 1);
+}
+
+bool RunwayTakeoff::throttle_closed_or_engine_off() const
+{
+    if (SRV_Channels::get_emergency_stop()) {
+        return true;
+    }
+#if AP_ICENGINE_ENABLED
+    const AP_ICEngine::ICE_State ice = plane.g2.ice_control.get_state();
+    if (ice != AP_ICEngine::ICE_DISABLED && ice != AP_ICEngine::ICE_RUNNING) {
+        return true;
+    }
+#endif
+    return SRV_Channels::get_output_scaled(SRV_Channel::k_throttle) <= RWY_THR_CLOSED_PCT;
+}
+
+// true if the GPS position is good enough to steer and check against
+bool RunwayTakeoff::gps_position_ok() const
+{
+    float hacc;
+    return plane.gps.status() >= AP_GPS::GPS_OK_FIX_3D &&
+           plane.gps.horizontal_accuracy(hacc) &&
+           hacc <= start_xtrk_max * RWY_GPS_ACC_FRAC;
 }
 
 void RunwayTakeoff::get_line_errors(float &xtrk, float &along) const
@@ -729,7 +870,9 @@ void RunwayTakeoff::write_log(float xtrk, float along, float hdg_err, float spd)
     // @Field: GP: true in the ground phase (on the runway, or aborted)
     // @Field: WL: roll limit hand-back factor applied, 0 wings held level to 1 stock limit
     // @Field: LA: steering lookahead distance used
-    AP::logger().WriteStreaming("RWYT", "TimeUS,XT,AT,HE,Spd,SE,V1,Abt,GP,WL,LA", "smmdnd----m", "F0000000000", "QfffffBBBff",
+    // @Field: DC: decelerating, and why: bit 0 brakes, bit 1 throttle closed or engine off, bit 2 abort
+    // @Field: BF: brake applied, 0 to 1
+    AP::logger().WriteStreaming("RWYT", "TimeUS,XT,AT,HE,Spd,SE,V1,Abt,GP,WL,LA,DC,BF", "smmdnd----m--", "F000000000000", "QfffffBBBffBf",
                                 AP_HAL::micros64(),
                                 (double)xtrk,
                                 (double)along,
@@ -740,7 +883,9 @@ void RunwayTakeoff::write_log(float xtrk, float along, float hdg_err, float spd)
                                 uint8_t(state.aborted),
                                 uint8_t(state.ground_phase),
                                 (double)state.wl_factor,
-                                (double)state.last_look);
+                                (double)state.last_look,
+                                state.decel_flags,
+                                (double)state.brake_frac);
 #endif
 
     // live values for GCS graphing at 5Hz
