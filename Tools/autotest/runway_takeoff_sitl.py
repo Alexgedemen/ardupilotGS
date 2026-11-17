@@ -11,7 +11,8 @@ usage:
 scenarios: stock, track, refuse, nodef, nowp, abort, abort_steer, past_v1,
            mission, all (default)
            wl, field, abort_return, abort_soft, brake_slip, brake_free,
-           brake_time, gps_acc, abort_hdg, abort_hdg_return (not in all)
+           brake_time, gps_acc, abort_hdg, abort_hdg_return, wl_rf,
+           wl_rf_none (not in all)
 
 After each scenario the newest dataflash log is summarised (RWYT, ATT,
 PIDS, GPS). RWY_BINARY overrides the SITL binary, for A/B runs.
@@ -112,7 +113,7 @@ RWY_PARAMS = {
 
 
 class Sim:
-    def __init__(self, start_offset_m, start_yaw_err_deg, instance=0):
+    def __init__(self, start_offset_m, start_yaw_err_deg, instance=0, boot_params=None):
         lat, lon = offset(THRESH_LAT, THRESH_LON, RWY_HDG_DEG + 90, start_offset_m)
         yaw = (RWY_HDG_DEG + start_yaw_err_deg) % 360
         home = "%.8f,%.8f,%.1f,%.1f" % (lat, lon, THRESH_ALT, yaw)
@@ -127,6 +128,13 @@ class Sim:
             # sets RC11_OPTION 0 at boot: engine by MAVLink command only
             os.path.join(ROOT, "Tools/autotest/runway_takeoff_sitl.parm"),
         ])
+        if boot_params:
+            # parameters that only take effect at boot (e.g. RNGFND1_TYPE)
+            boot = os.path.join(self.workdir, "boot.parm")
+            with open(boot, "w") as f:
+                for k, v in boot_params.items():
+                    f.write("%s %s\n" % (k, v))
+            defaults += "," + boot
         cmd = [BINARY, "--model", "plane-ice-steering", "--home", home,
                "--defaults", defaults, "--speedup", os.environ.get("RWY_SPEEDUP", "5"), "-I%d" % instance, "-w"]
         self.proc = subprocess.Popen(cmd, cwd=self.workdir,
@@ -312,9 +320,9 @@ def log_report(path, minspd):
         print("  log: none")
         return {}
     log = DFReader.DFReader_binary(path)
-    rwyt, att, pids, gps = [], [], [], []
+    rwyt, att, pids, gps, rwyh = [], [], [], [], []
     while True:
-        m = log.recv_match(type=["RWYT", "ATT", "PIDS", "GPS"])
+        m = log.recv_match(type=["RWYT", "ATT", "PIDS", "GPS", "RWYH"])
         if m is None:
             break
         t = m.get_type()
@@ -326,6 +334,8 @@ def log_report(path, minspd):
             pids.append((m.TimeUS, m.I))
         elif t == "GPS" and getattr(m, "I", 0) == 0:
             gps.append((m.TimeUS, m.Spd))
+        elif t == "RWYH":
+            rwyh.append(m)
 
     def gps_spd(tus):
         best = None
@@ -386,6 +396,23 @@ def log_report(path, minspd):
         on_ground = [abs(d) for (t, d, _) in att if rwyt[0].TimeUS <= t <= rwyt[-1].TimeUS]
         if on_ground:
             print("  log takeoff: max |DesRoll| %.2f deg over the logged takeoff" % max(on_ground))
+    if rwyh and "GP" in has:
+        # RWY_WL_HGT: desired roll near the runway after rotate speed
+        end = [r.TimeUS for i, r in enumerate(rwyt[1:]) if rwyt[i].GP and not r.GP]
+        if end:
+            t_end = end[0]
+            lift = [h.TimeUS for h in rwyh if h.TimeUS >= t_end and h.H > 0.1]
+            low = [h.TimeUS for h in rwyh if h.TimeUS >= t_end and h.H < 0.1]
+            near = [abs(d) for (t, d, _) in att
+                    if t >= t_end and any(abs(t - tl) < 100000 for tl in low)]
+            print("  log RWYH: ref %.2f m, rangefinder usable %d/%d samples; height passed 0.1 m %s after rotate "
+                  "speed; max |DesRoll| below 0.1 m after rotate speed %s" % (
+                      rwyh[-1].Ref, sum(h.RFok for h in rwyh), len(rwyh),
+                      "%.2f s" % ((lift[0] - t_end) * 1e-6) if lift else "never",
+                      "%.2f deg" % max(near) if near else "-"))
+            wl_at = [(h.TimeUS, h.H, h.HF) for h in rwyh if h.TimeUS >= t_end][:40:4]
+            print("  log RWYH after rotate speed (t, H, HF): " + " ".join(
+                "%.1f:%.2f:%.2f" % (t * 1e-6, hh, hf) for (t, hh, hf) in wl_at))
     if "LA" in has:
         print("  log LA: %.1f to %.1f m" % (min(r.LA for r in rwyt), max(r.LA for r in rwyt)))
     if "DC" in has:
@@ -406,9 +433,9 @@ def log_report(path, minspd):
 
 
 def scenario(name, params, start_offset, yaw_err, run_s, extra=None, ref=True, b_cmd=None, items_extra=None,
-             hold_brake=False):
+             hold_brake=False, boot_params=None):
     print("\n=== %s: start offset %.1fm right, yaw err %+.1f deg ===" % (name, start_offset, yaw_err))
-    sim = Sim(start_offset, yaw_err)
+    sim = Sim(start_offset, yaw_err, boot_params=boot_params)
     try:
         sim.set_params(BASE_PARAMS)
         sim.set_params(params)
@@ -654,6 +681,16 @@ def main():
     if named("wl"):
         p = dict(RWY_PARAMS, RWY_ENABLE=3, RWY_V1=13, TKOFF_THR_MAX=100)
         results["wl"] = scenario("wings level on the ground", p, 2.0, 3.0, 45)
+    if named("wl_rf"):
+        # RWY_WL_HGT with a simulated downward rangefinder
+        p = dict(RWY_PARAMS, RWY_ENABLE=3, RWY_V1=13, TKOFF_THR_MAX=100, RWY_WL_HGT=2)
+        results["wl_rf"] = scenario("wings level, hand-back by rangefinder height", p, 2.0, 3.0, 45,
+                                    boot_params={"RNGFND1_TYPE": 100, "RNGFND1_ORIENT": 25,
+                                                 "RNGFND1_MIN": 0.3, "RNGFND1_MAX": 50})
+    if named("wl_rf_none"):
+        # RWY_WL_HGT set but no rangefinder: the takeoff must be refused
+        p = dict(RWY_PARAMS, RWY_ENABLE=3, RWY_V1=13, TKOFF_THR_MAX=100, RWY_WL_HGT=2)
+        results["wl_rf_none"] = scenario("RWY_WL_HGT without a rangefinder", p, 0.0, 0.0, 15)
     if named("wl_off"):
         p = dict(RWY_PARAMS, RWY_V1=13, TKOFF_THR_MAX=100)
         results["wl_off"] = scenario("wings level off (RWY_ENABLE 1)", p, 2.0, 3.0, 45)
@@ -701,7 +738,8 @@ def main():
     for k, r in results.items():
         st = r["stats"]
         aborted = any("ABORT" in t for t in r["texts"])
-        refused = any("RWY: start" in t or "RWY: no runway" in t or "RWY: GPS" in t for t in r["texts"])
+        refused = any("RWY: start" in t or "RWY: no runway" in t or "RWY: GPS" in t or "RWY: RWY_WL_HGT" in t
+                      for t in r["texts"])
         landed = any("Landed" in t or "Flare" in t for t in r["texts"])
         print("%-11s max|xt| roll %s  max yaw rate %s  xt@30m %s  final alt %s  aborted=%s refused=%s landed=%s" % (
             k,
