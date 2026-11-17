@@ -30,7 +30,8 @@
 
   RWY_ENABLE bit 1 holds the wings level while on the runway, including
   during an abort, and hands back to the stock roll limit over
-  RWY_WL_FADE once rotate speed is reached.
+  RWY_WL_FADE once rotate speed is reached; with RWY_WL_HGT, in
+  proportion to the downward rangefinder's height above the runway.
 
   With RWY_ENABLE=0 the stock takeoff behaviour is unchanged.
  */
@@ -130,6 +131,7 @@ private:
     AP_Float look_max;         // m, 0 disables
     AP_Float brk_gain;         // steering gain at full brake, 1 disables
     AP_Float brk_tmax;         // s, brake operating time warning, 0 disables
+    AP_Float wl_hgt;           // m, wings level hand-back by height, 0 disables
 
     struct {
         Location point_a;      // TAKEOFF item: start of the runway line
@@ -155,8 +157,14 @@ private:
         uint32_t last_clear_msg_ms;
         bool ground_phase;     // on the runway: wings held level
         bool past_rotate;      // rotate speed reached on this roll
-        uint32_t ground_end_ms; // when the ground phase last ended, 0 while in it
+        uint32_t last_gp_us;   // last update_ground_phase() call
         float wl_factor;       // roll limit hand-back, 0 (level) to 1 (stock)
+        bool rf_ok;            // RWY_WL_HGT: rangefinder usable
+        bool rf_ref_valid;
+        bool rf_lost;          // rangefinder failure reported on this roll
+        float rf_ref;          // m, rangefinder reading on the runway
+        float rf_above;        // m, height above the runway
+        float rf_factor;       // roll limit factor the height allows
         float last_look;       // m, steering lookahead used, for logging
         float brake_frac;      // brake applied, 0 to 1
         uint16_t brake_out_pwm; // abort brake override last written, 0 if none
@@ -189,6 +197,8 @@ private:
     float speed_for_v1() const;
     bool abort_enabled() const;
     bool reached_rotate_speed() const;
+    bool wl_height_mode() const { return is_positive(wl_hgt); }
+    bool rangefinder_height(float &hgt) const;
     float lookahead_m(float gspd) const;
     void update_brakes();
     float brake_fraction() const;

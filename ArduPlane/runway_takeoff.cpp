@@ -78,6 +78,12 @@
 // consecutive navigation cycles (10Hz) before the abort
 #define RWY_HOLD_DEBOUNCE_COUNT 5
 
+// RWY_WL_HGT: time constant of the filter that learns the rangefinder's
+// reading on the runway during the ground phase, and the largest
+// reading accepted on the ground at the start of the takeoff
+#define RWY_RF_REF_TC_S 1.0f
+#define RWY_RF_GROUND_MAX_M 2.0f
+
 // brake operating time warning: lead time before RWY_BRK_TMAX (at most
 // half of it), and the repeat interval
 #define RWY_BRK_WARN_LEAD_S 30.0f
@@ -191,7 +197,7 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: WL_FADE
     // @DisplayName: Wings level hand-back time
-    // @Description: With RWY_ENABLE bit 1 set, the time over which the roll limit is raised from zero back to the stock takeoff roll limit (LEVEL_ROLL_LIMIT, then the TKOFF_LVL_ALT scaling) once the ground phase ends. 0 restores it at once.
+    // @Description: With RWY_ENABLE bit 1 set, the time over which the roll limit is raised from zero back to the stock takeoff roll limit (LEVEL_ROLL_LIMIT, then the TKOFF_LVL_ALT scaling) once the ground phase ends. With RWY_WL_HGT set this is the fastest the limit may rise, and the height above the runway sets how far. 0 restores it at once.
     // @Units: s
     // @Range: 0 5
     // @Increment: 0.1
@@ -223,6 +229,15 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
     // @Increment: 1
     // @User: Advanced
     AP_GROUPINFO("BRK_TMAX", 18, RunwayTakeoff, brk_tmax, 90),
+
+    // @Param: WL_HGT
+    // @DisplayName: Wings level hand-back height
+    // @Description: With RWY_ENABLE bit 1 set, if non-zero, the roll limit is handed back by height above the runway instead of by time alone: after rotate speed it rises in proportion to the downward rangefinder's height above its reading on the runway, reaching the stock takeoff roll limit at this height, and drops back if the aircraft settles or bounces. It still rises no faster than RWY_WL_FADE allows. Uses the rangefinder set by RNGFND_LND_ORNT (pointing down by default); takeoff is refused if it is not working, and if it fails after rotate speed the hand-back continues by time. 0 hands back by time only.
+    // @Units: m
+    // @Range: 0 10
+    // @Increment: 0.1
+    // @User: Advanced
+    AP_GROUPINFO("WL_HGT", 19, RunwayTakeoff, wl_hgt, 0),
 
     AP_GROUPEND
 };
@@ -335,8 +350,15 @@ bool RunwayTakeoff::launch_allowed(bool in_auto)
             return false;
         }
     }
+    if (option_set(Option::WINGS_LEVEL) && wl_height_mode()) {
+        float hgt;
+        if (!rangefinder_height(hgt) || hgt > RWY_RF_GROUND_MAX_M) {
+            refuse("RWY: RWY_WL_HGT needs a working down rangefinder");
+            return false;
+        }
+    }
     if (option_set(Option::WINGS_LEVEL)) {
-        if (wow_available()) {
+        if (!wl_height_mode() && wow_available()) {
 #if AP_LANDINGGEAR_ENABLED
             if (plane.g2.landing_gear.get_wow_state() != AP_LandingGear::LG_WOW) {
                 refuse("RWY: weight on wheels switch reads airborne");
@@ -398,6 +420,8 @@ void RunwayTakeoff::launch_started()
     state.roll_started = true;
     state.past_v1 = false;
     state.past_rotate = false;
+    state.rf_ref_valid = false;
+    state.rf_lost = false;
     state.abort_count = 0;
     state.max_abs_xtrk = 0;
     state.blend_start_ms = 0;
@@ -437,16 +461,21 @@ void RunwayTakeoff::update_l1()
 
 /*
   track the ground phase of the takeoff: from the start of the roll
-  until rotate speed (or, with a weight on wheels switch, while it reads
-  on the ground), and throughout an abort. Sets the roll limit hand-back
-  factor: 0 in the ground phase, then ramped to 1 over RWY_WL_FADE
+  until rotate speed (or, with a weight on wheels switch and no
+  RWY_WL_HGT, while it reads on the ground), and throughout an abort.
+  Sets the roll limit hand-back factor: 0 in the ground phase, then
+  rising to 1 no faster than RWY_WL_FADE allows and, with RWY_WL_HGT,
+  no further than the height above the runway allows
  */
 void RunwayTakeoff::update_ground_phase()
 {
+    const uint32_t now_us = AP_HAL::micros();
+    const float dt = constrain_float((now_us - state.last_gp_us) * 1.0e-6f, 0, 0.1f);
+    state.last_gp_us = now_us;
+
     if (!active() || plane.control_mode != &plane.mode_auto ||
         !(state.roll_started || state.aborted)) {
         state.ground_phase = false;
-        state.ground_end_ms = 0;
         state.wl_factor = 1;
         return;
     }
@@ -458,7 +487,7 @@ void RunwayTakeoff::update_ground_phase()
 
     bool on_ground = !state.past_rotate;
 #if AP_LANDINGGEAR_ENABLED
-    if (wow_available()) {
+    if (!wl_height_mode() && wow_available()) {
         // a bounce returns to the ground phase
         on_ground = plane.g2.landing_gear.get_wow_state() == AP_LandingGear::LG_WOW;
     }
@@ -466,20 +495,45 @@ void RunwayTakeoff::update_ground_phase()
     if (state.aborted) {
         on_ground = true;
     }
-
-    const uint32_t now_ms = AP_HAL::millis();
     state.ground_phase = on_ground;
+
+    float hgt;
+    state.rf_ok = wl_height_mode() && rangefinder_height(hgt);
     if (on_ground) {
-        state.ground_end_ms = 0;
         state.wl_factor = 0;
-    } else {
-        if (state.ground_end_ms == 0) {
-            state.ground_end_ms = MAX(now_ms, 1U);
+        if (state.rf_ok) {
+            // learn the rangefinder's reading on the runway, including
+            // the gear extending as the wing takes the weight
+            if (!state.rf_ref_valid) {
+                state.rf_ref = hgt;
+                state.rf_ref_valid = true;
+            } else {
+                state.rf_ref += (hgt - state.rf_ref) * constrain_float(dt / RWY_RF_REF_TC_S, 0, 1);
+            }
         }
-        if (is_positive(wl_fade)) {
-            state.wl_factor = constrain_float((now_ms - state.ground_end_ms) * 0.001f / wl_fade, 0, 1);
+        state.rf_above = 0;
+        state.rf_factor = 0;
+    } else {
+        float target = 1;
+        if (wl_height_mode()) {
+            if (state.rf_ok && state.rf_ref_valid) {
+                // in proportion to height, so wingtip clearance grows with
+                // bank, and a bounce takes the limit back down
+                state.rf_above = MAX(hgt - state.rf_ref, 0);
+                state.rf_factor = constrain_float(state.rf_above / wl_hgt, 0, 1);
+                target = state.rf_factor;
+            } else if (!state.rf_lost) {
+                state.rf_lost = true;
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "RWY: rangefinder lost, wings level by time");
+            }
+        }
+        if (target < state.wl_factor) {
+            // down at once: a settle or bounce
+            state.wl_factor = target;
+        } else if (is_positive(wl_fade)) {
+            state.wl_factor = MIN(target, state.wl_factor + dt / wl_fade);
         } else {
-            state.wl_factor = 1;
+            state.wl_factor = target;
         }
     }
     if (!option_set(Option::WINGS_LEVEL)) {
@@ -1014,6 +1068,43 @@ bool RunwayTakeoff::reached_rotate_speed() const
     return false;
 }
 
+/*
+  height of the landing rangefinder (RNGFND_LND_ORNT) above the ground,
+  corrected for attitude. Below its minimum range, as on the wheels, the
+  minimum range is returned; above its maximum, the maximum. False if
+  it can't be used
+ */
+bool RunwayTakeoff::rangefinder_height(float &hgt) const
+{
+#if AP_RANGEFINDER_ENABLED
+    const Rotation orient = plane.rangefinder_orientation();
+    const RangeFinder &rf = plane.rangefinder;
+    switch (rf.status_orient(orient)) {
+    case RangeFinder::Status::OutOfRangeLow:
+        hgt = rf.min_distance_orient(orient);
+        return true;
+    case RangeFinder::Status::OutOfRangeHigh:
+        hgt = rf.max_distance_orient(orient);
+        return true;
+    case RangeFinder::Status::Good: {
+        Vector3f v{rf.distance_orient(orient), 0, 0};
+        v.rotate(orient);
+        v = plane.ahrs.get_rotation_body_to_ned() * v;
+        if (!is_positive(v.z)) {
+            // not pointing at the ground
+            return false;
+        }
+        hgt = v.z;
+        return true;
+    }
+    default:
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
 // true if a weight on wheels switch is configured
 bool RunwayTakeoff::wow_available()
 {
@@ -1098,6 +1189,22 @@ void RunwayTakeoff::write_log(float xtrk, float along, float hdg_err, float spd)
                                 (double)state.steer_soft,
                                 (double)state.blend,
                                 (double)state.brake_time_s);
+
+    if (wl_height_mode()) {
+        // @LoggerMessage: RWYH
+        // @Description: Runway takeoff wings level hand-back by height above the runway (RWY_WL_HGT)
+        // @Field: TimeUS: Time since system startup
+        // @Field: H: rangefinder height above the runway, 0 in the ground phase
+        // @Field: Ref: rangefinder reading on the runway, learned in the ground phase
+        // @Field: HF: roll limit factor the height allows, 0 to 1
+        // @Field: RFok: true if the rangefinder could be used
+        AP::logger().WriteStreaming("RWYH", "TimeUS,H,Ref,HF,RFok", "smm--", "F0000", "QfffB",
+                                    AP_HAL::micros64(),
+                                    (double)state.rf_above,
+                                    (double)state.rf_ref,
+                                    (double)state.rf_factor,
+                                    uint8_t(state.rf_ok));
+    }
 #endif
 
     // live values for GCS graphing at 5Hz
