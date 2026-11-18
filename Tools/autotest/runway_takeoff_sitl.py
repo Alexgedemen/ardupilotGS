@@ -12,7 +12,7 @@ scenarios: stock, track, refuse, nodef, nowp, abort, abort_steer, past_v1,
            mission, all (default)
            wl, field, abort_return, abort_soft, brake_slip, brake_free,
            brake_time, gps_acc, abort_hdg, abort_hdg_return, wl_rf,
-           wl_rf_none (not in all)
+           wl_rf_none, land_stock, land_rwy (not in all)
 
 After each scenario the newest dataflash log is summarised (RWYT, ATT,
 PIDS, GPS). RWY_BINARY overrides the SITL binary, for A/B runs.
@@ -41,6 +41,7 @@ THRESH_LON = 149.165230
 THRESH_ALT = 584
 RWY_HDG_DEG = 90.0
 B_DIST_M = 1500.0
+LAND_DIST_M = 300.0
 
 EARTH_R = 6378137.0
 
@@ -147,6 +148,7 @@ class Sim:
         self.track = []      # (t, xtrk, along, spd, alt)
         self.brake_pwm = []  # (t, pwm9, pwm3)
         self.att = []        # (t, yaw_deg, yawrate_dps)
+        self.navroll = []    # (t, nav_roll_deg)
         self.last_rc = {}
         for stream in (mavutil.mavlink.MAV_DATA_STREAM_ALL,):
             self.mav.mav.request_data_stream_send(1, 1, stream, 20, 1)
@@ -178,6 +180,8 @@ class Sim:
             self.track.append((time.time(), x, a, spd, m.relative_alt * 0.001, m.lat * 1e-7, m.lon * 1e-7))
         elif t == "SERVO_OUTPUT_RAW":
             self.brake_pwm.append((time.time(), m.servo9_raw, m.servo3_raw, m.time_usec * 1e-6))
+        elif t == "NAV_CONTROLLER_OUTPUT":
+            self.navroll.append((time.time(), m.nav_roll))
         elif t == "ATTITUDE":
             self.att.append((time.time(), math.degrees(m.yaw), math.degrees(m.yawspeed)))
 
@@ -320,9 +324,9 @@ def log_report(path, minspd):
         print("  log: none")
         return {}
     log = DFReader.DFReader_binary(path)
-    rwyt, att, pids, gps, rwyh = [], [], [], [], []
+    rwyt, att, pids, gps, rwyh, rwyl = [], [], [], [], [], []
     while True:
-        m = log.recv_match(type=["RWYT", "ATT", "PIDS", "GPS", "RWYH"])
+        m = log.recv_match(type=["RWYT", "ATT", "PIDS", "GPS", "RWYH", "RWYL"])
         if m is None:
             break
         t = m.get_type()
@@ -336,6 +340,8 @@ def log_report(path, minspd):
             gps.append((m.TimeUS, m.Spd))
         elif t == "RWYH":
             rwyh.append(m)
+        elif t == "RWYL":
+            rwyl.append(m)
 
     def gps_spd(tus):
         best = None
@@ -359,6 +365,22 @@ def log_report(path, minspd):
         rep["max_I"] = max(abs(i) for (_, i) in pids)
         print("  log PIDS: max |I| %.3f, max |I| below MINSPD %s" % (
             rep["max_I"], "%.3f" % rep["max_I_below_minspd"] if slow_i else "-"))
+    if rwyl:
+        # runway landing: touchdown, rollout steering and wings level
+        td = [r for r in rwyl if r.TD]
+        if td:
+            t_td = td[0].TimeUS
+            print("  log RWYL: touchdown at %.1f s, XT %+.2f m, HE %+.1f deg, Spd %.1f m/s; rollout max |XT| %.2f m, "
+                  "end XT %+.2f m; min SF %.2f; Bl reached %.2f" % (
+                      t_td * 1e-6, td[0].XT, td[0].HE, td[0].Spd, max(abs(r.XT) for r in td), td[-1].XT,
+                      min(r.SF for r in td), max(r.Bl for r in td)))
+        else:
+            print("  log RWYL: no touchdown seen")
+        low = [r.TimeUS for r in rwyl if r.TD or 0 <= r.H < 0.5]
+        near = [abs(d) for (t, d, _) in att if low and low[0] <= t <= rwyl[-1].TimeUS]
+        if near:
+            print("  log RWYL: max |DesRoll| from 0.5 m above the runway to the end %.2f deg (WL min %.2f)" % (
+                max(near), min(r.WL for r in rwyl)))
     if not rwyt:
         print("  log RWYT: none")
         return rep
@@ -599,6 +621,56 @@ def brake_time_test():
         sim.close()
 
 
+def mission_items_circuit():
+    """after takeoff, fly a circuit and land back on the same runway,
+    heading RWY_HDG_DEG, touching down LAND_DIST_M past the threshold.
+    The waypoint after LAND is further along the centreline: the
+    runway landing (RWY_ENABLE bit 2) tracks LAND -> that waypoint"""
+    wp = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
+    rel = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
+
+    def pt(east, north):
+        la, lo = offset(THRESH_LAT, THRESH_LON, RWY_HDG_DEG, east)
+        return offset(la, lo, RWY_HDG_DEG - 90, north)
+    items = []
+    # RWY_APPROACH_OFFSET puts the approach waypoint off the centreline (m, left)
+    app_n = float(os.environ.get("RWY_APPROACH_OFFSET", "0"))
+    for (e, n, alt) in [(3000, 0, 80), (3000, 1200, 80), (-2500, 1200, 60), (-1500, app_n, 40)]:
+        la, lo = pt(e, n)
+        items.append((wp, 0, 0, 0, 0, la, lo, alt, rel))
+    la, lo = pt(LAND_DIST_M, 0)
+    items.append((mavutil.mavlink.MAV_CMD_NAV_LAND, 0, 0, 0, 0, la, lo, 0, rel))
+    la, lo = pt(LAND_DIST_M + 900, 0)
+    items.append((wp, 0, 0, 0, 0, la, lo, 60, rel))
+    return items
+
+
+def land_extra(sim):
+    """fly the circuit; apply the RC brakes from touchdown; report the
+    landing rollout against the runway centreline"""
+    t_end = time.time() + 1500 / float(os.environ.get("RWY_SPEEDUP", "5"))
+    braked = False
+    while time.time() < t_end and not any("Throttle disarmed" in t for t in sim.texts):
+        if not braked and any(("touchdown" in t or "Flare" in t) for t in sim.texts) and \
+                sim.track and sim.track[-1][4] < 0.5:
+            braked = True
+            sim.rc_override({9: 1900})
+        sim.rc_override({})
+        sim.pump(0.5)
+    top = max(range(len(sim.track)), key=lambda i: sim.track[i][4]) if sim.track else 0
+    roll = [p for p in sim.track[top:] if p[4] < 0.5 and p[3] > 0.5]
+    if roll:
+        t_low = [p[0] for p in sim.track[top:] if p[4] < 0.5]
+        near = [abs(r) for (t, r) in sim.navroll if t_low and t >= t_low[0]]
+        if near:
+            print("  landing: max |nav_roll| from 0.5 m above the runway to the end %.2f deg" % max(near))
+        xs = [p[1] for p in roll]
+        print("  landing rollout: %d samples, xt at touchdown %+.2f m, max |xt| %.2f m, end %+.2f m, "
+              "%.0f m past the threshold at the end" % (len(xs), xs[0], max(abs(x) for x in xs), xs[-1], roll[-1][2]))
+    else:
+        print("  landing rollout: not seen")
+
+
 def mission_items_other_runway():
     """after takeoff, fly to a second runway 2 km north of the first,
     heading 180, and land on it (WP before LAND -> LAND on its centreline)"""
@@ -691,6 +763,19 @@ def main():
         # RWY_WL_HGT set but no rangefinder: the takeoff must be refused
         p = dict(RWY_PARAMS, RWY_ENABLE=3, RWY_V1=13, TKOFF_THR_MAX=100, RWY_WL_HGT=2)
         results["wl_rf_none"] = scenario("RWY_WL_HGT without a rangefinder", p, 0.0, 0.0, 15)
+    if named("land_stock") or named("land_rwy"):
+        # take off, fly a circuit and land back on the runway in the crosswind
+        rf = {"RNGFND1_TYPE": 100, "RNGFND1_ORIENT": 25, "RNGFND1_MIN": 0.3, "RNGFND1_MAX": 50}
+        p = dict(RWY_PARAMS, RWY_ENABLE=3, RWY_V1=13, TKOFF_THR_MAX=100, RWY_WL_HGT=2, RWY_LOOK_MAX=50,
+                 RWY_BRK_GAIN=0.6, STEER2SRV_I=0.2)
+        if named("land_stock"):
+            results["land_stock"] = scenario("circuit, stock landing (RWY_ENABLE 3)", p, 0.0, 0.0, 0,
+                                             extra=land_extra, items_extra=mission_items_circuit(),
+                                             boot_params=rf)
+        if named("land_rwy"):
+            results["land_rwy"] = scenario("circuit, runway landing (RWY_ENABLE 7)", dict(p, RWY_ENABLE=7), 0.0, 0.0,
+                                           0, extra=land_extra, items_extra=mission_items_circuit(),
+                                           boot_params=rf)
     if named("wl_off"):
         p = dict(RWY_PARAMS, RWY_V1=13, TKOFF_THR_MAX=100)
         results["wl_off"] = scenario("wings level off (RWY_ENABLE 1)", p, 2.0, 3.0, 45)
