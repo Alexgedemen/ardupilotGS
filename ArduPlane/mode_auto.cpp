@@ -97,6 +97,13 @@ void ModeAuto::update()
         // allow landing to restrict the roll limits
         plane.nav_roll_cd = plane.landing.constrain_roll(plane.nav_roll_cd, plane.g.level_roll_limit*100UL);
 
+#if AP_PLANE_RUNWAY_TAKEOFF_ENABLED
+        // runway landing: wings level near and on the runway
+        const int32_t land_roll_limit_cd = plane.runway_takeoff.landing_roll_limit_cd(
+            plane.landing.constrain_roll(plane.roll_limit_cd, plane.g.level_roll_limit*100UL));
+        plane.nav_roll_cd = constrain_int32(plane.nav_roll_cd, -land_roll_limit_cd, land_roll_limit_cd);
+#endif
+
         if (plane.landing.is_throttle_suppressed()) {
             // if landing is considered complete throttle is never allowed, regardless of landing type
             SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, 0.0);

@@ -239,6 +239,10 @@ bool Plane::verify_command(const AP_Mission::Mission_Command& cmd)        // Ret
             return quadplane.verify_vtol_land();
         }
 #endif
+#if AP_PLANE_RUNWAY_TAKEOFF_ENABLED
+        // runway landing: touchdown detection, reporting and logging
+        runway_takeoff.update_landing();
+#endif
         if (flight_stage == AP_FixedWing::FlightStage::ABORT_LANDING) {
             return landing.verify_abort_landing(prev_WP_loc, next_WP_loc, current_loc, auto_state.takeoff_altitude_rel_cm, throttle_suppressed);
 
@@ -435,6 +439,11 @@ void Plane::do_land(const AP_Mission::Mission_Command& cmd)
         // if we were in an abort we need to explicitly move out of the abort state, as it's sticky
         set_flight_stage(AP_FixedWing::FlightStage::LAND);
     }
+
+#if AP_PLANE_RUNWAY_TAKEOFF_ENABLED
+    // the LAND lat/lon and the next waypoint define the rollout line
+    runway_takeoff.init_landing(cmd);
+#endif
 }
 
 #if HAL_QUADPLANE_ENABLED

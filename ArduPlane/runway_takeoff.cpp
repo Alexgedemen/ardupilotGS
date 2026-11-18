@@ -84,6 +84,16 @@
 #define RWY_RF_REF_TC_S 1.0f
 #define RWY_RF_GROUND_MAX_M 2.0f
 
+// runway landing: touchdown when the rangefinder is within this height of
+// the runway for this many navigation cycles (10Hz)
+#define RWY_TD_HGT_M 0.15f
+#define RWY_TD_DEBOUNCE_COUNT 3
+// ground speed at which the rollout is reported as done
+#define RWY_LAND_STOP_SPEED 1.0f
+// warn if the approach (previous waypoint to LAND) is further off the
+// landing line than this
+#define RWY_LAND_APPROACH_TOL_DEG 10.0f
+
 // brake operating time warning: lead time before RWY_BRK_TMAX (at most
 // half of it), and the repeat interval
 #define RWY_BRK_WARN_LEAD_S 30.0f
@@ -93,8 +103,8 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: ENABLE
     // @DisplayName: Runway takeoff enable
-    // @Description: Bit 0 enables runway centreline tracking for AUTO takeoffs. The runway line runs from the NAV_TAKEOFF item lat/lon (point A, surveyed centreline point at the start end) to the next mission waypoint (point B, surveyed centreline point at the departure end or beyond). When enabled, auto takeoff is refused if the runway is not defined or the start checks fail. Bit 1 holds the wings level on the ground: no bank demand from the start of the roll until TKOFF_ROTATE_SPD (RWY_V1 if that is 0) or, if a weight on wheels switch is configured, while it reads on the ground, and throughout an abort; then the stock takeoff roll limit is restored over RWY_WL_FADE. The other bits do nothing unless bit 0 is set.
-    // @Bitmask: 0:Runway takeoff,1:Wings level on the ground
+    // @Description: Bit 0 enables runway centreline tracking for AUTO takeoffs. The runway line runs from the NAV_TAKEOFF item lat/lon (point A, surveyed centreline point at the start end) to the next mission waypoint (point B, surveyed centreline point at the departure end or beyond). When enabled, auto takeoff is refused if the runway is not defined or the start checks fail. Bit 1 holds the wings level on the ground: no bank demand from the start of the roll until TKOFF_ROTATE_SPD (RWY_V1 if that is 0) or, if a weight on wheels switch is configured, while it reads on the ground, and throughout an abort; then the stock takeoff roll limit is restored over RWY_WL_FADE. Bit 2 is the runway landing: on the rollout the steering tracks the line from the NAV_LAND lat/lon (the touchdown point on the centreline) to the next mission item, which must be a waypoint further along the centreline, with the lookahead held at RWY_LOOK_MAX and the steering softened under braking (RWY_BRK_GAIN). Touchdown is seen by the rangefinder (RWY_WL_HGT) or a weight on wheels switch. With bits 1 and 2 the wings are also held level near and on the runway on landing. The other bits do nothing unless bit 0 is set.
+    // @Bitmask: 0:Runway takeoff,1:Wings level on the ground,2:Runway landing
     // @User: Advanced
     AP_GROUPINFO_FLAGS("ENABLE", 1, RunwayTakeoff, enable, 0, AP_PARAM_FLAG_ENABLE),
 
@@ -165,7 +175,7 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: BLEND
     // @DisplayName: Steering fade-in time
-    // @Description: Time over which the runway steering correction is faded in, to avoid a step in the steering demand. The fade-in starts when the aircraft starts rolling (1 m/s ground speed), not when the takeoff is triggered.
+    // @Description: Time over which the runway steering correction is faded in, to avoid a step in the steering demand. The fade-in starts when the aircraft starts rolling (1 m/s ground speed), not when the takeoff is triggered. On a runway landing the stock rollout steering is faded into the runway steering over this time from touchdown.
     // @Units: s
     // @Range: 0 10
     // @User: Advanced
@@ -206,7 +216,7 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: LOOK_MAX
     // @DisplayName: Steering lookahead limit
-    // @Description: If non-zero, the upper limit on the runway steering lookahead distance (RWY_LOOKAHEAD seconds of travel, minimum 10 m), so the cross-track correction keeps its authority at high speed. 0 means no limit.
+    // @Description: If non-zero, the upper limit on the runway steering lookahead distance (RWY_LOOKAHEAD seconds of travel, minimum 10 m), so the cross-track correction keeps its authority at high speed. While decelerating the lookahead moves to this value, and on a runway landing rollout it is held at this value. 0 means no limit (and after an abort or on a landing rollout, the runway direction is held instead of returning to the line).
     // @Units: m
     // @Range: 0 200
     // @Increment: 1
@@ -215,7 +225,7 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: BRK_GAIN
     // @DisplayName: Steering gain at full brake
-    // @Description: Runway steering response to heading error at full brake, relative to unbraked. Braking makes the nosewheel more effective, so the response is reduced in proportion to the brake applied (from the brake output against its SERVOn_TRIM and RWY_BRK_PWM), down to this at full brake. Applies to any braking during the roll or an abort. 1.0 leaves the steering unchanged.
+    // @Description: Runway steering response to heading error at full brake, relative to unbraked. Braking makes the nosewheel more effective, so the response is reduced in proportion to the brake applied (from the brake output against its SERVOn_TRIM and RWY_BRK_PWM), down to this at full brake. Applies to any braking during the roll, an abort or a runway landing rollout. 1.0 leaves the steering unchanged.
     // @Range: 0.1 1
     // @Increment: 0.05
     // @User: Advanced
@@ -232,7 +242,7 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: WL_HGT
     // @DisplayName: Wings level hand-back height
-    // @Description: With RWY_ENABLE bit 1 set, if non-zero, the roll limit is handed back by height above the runway instead of by time alone: after rotate speed it rises in proportion to the downward rangefinder's height above its reading on the runway, reaching the stock takeoff roll limit at this height, and drops back if the aircraft settles or bounces. It still rises no faster than RWY_WL_FADE allows. Uses the rangefinder set by RNGFND_LND_ORNT (pointing down by default); takeoff is refused if it is not working, and if it fails after rotate speed the hand-back continues by time. 0 hands back by time only.
+    // @Description: With RWY_ENABLE bit 1 set, if non-zero, the roll limit is handed back by height above the runway instead of by time alone: after rotate speed it rises in proportion to the downward rangefinder's height above its reading on the runway, reaching the stock takeoff roll limit at this height, and drops back if the aircraft settles or bounces. It still rises no faster than RWY_WL_FADE allows. Uses the rangefinder set by RNGFND_LND_ORNT (pointing down by default); takeoff is refused if it is not working, and if it fails after rotate speed the hand-back continues by time. On a runway landing (RWY_ENABLE bits 1 and 2) the limit falls in proportion to the height above the runway in the same way, and touchdown is when the height is under 0.15 m; the runway level learned on takeoff is used, or RNGFND1_GNDCLR if there was none. 0 hands back by time only.
     // @Units: m
     // @Range: 0 10
     // @Increment: 0.1
@@ -246,6 +256,7 @@ RunwayTakeoff::RunwayTakeoff(void)
 {
     AP_Param::setup_object_defaults(this, var_info);
     state.steer_soft = 1;
+    land.wl_factor = 1;
 }
 
 /*
@@ -274,25 +285,11 @@ void RunwayTakeoff::init(const AP_Mission::Mission_Command &cmd)
         return;
     }
 
-    // find the next navigation command without changing mission state
-    // (get_next_nav_cmd() can modify DO_JUMP counters)
-    AP_Mission::Mission_Command next {};
-    bool found = false;
-    const uint16_t num_cmds = plane.mission.num_commands();
-    for (uint16_t i = cmd.index + 1; i < num_cmds; i++) {
-        if (!plane.mission.read_cmd_from_storage(i, next)) {
-            break;
-        }
-        if (AP_Mission::is_nav_cmd(next)) {
-            found = true;
-            break;
-        }
-    }
-    if (!found || next.id != MAV_CMD_NAV_WAYPOINT) {
+    Location b;
+    if (!waypoint_after(cmd.index, b)) {
         GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "RWY: need WAYPOINT after TAKEOFF (point B)");
         return;
     }
-    const Location &b = next.content.location;
     const float len = a.get_distance(b);
     if (len < RWY_MIN_LINE_LENGTH_M) {
         GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "RWY: A to B only %.0fm, need %.0fm",
@@ -560,6 +557,10 @@ int32_t RunwayTakeoff::ground_roll_limit_cd(int32_t stock_limit_cd)
  */
 void RunwayTakeoff::ground_steering_error(int32_t &bearing_error_cd)
 {
+    if (landing_rollout()) {
+        landing_steering_error(bearing_error_cd);
+        return;
+    }
     if (!active() || plane.control_mode != &plane.mode_auto ||
         !(state.roll_started || state.aborted)) {
         return;
@@ -1007,14 +1008,331 @@ bool RunwayTakeoff::gps_position_ok() const
            hacc <= start_xtrk_max * RWY_GPS_ACC_FRAC;
 }
 
+/*
+  runway landing (RWY_ENABLE bit 2). The rollout line runs from the
+  NAV_LAND lat/lon (A, the touchdown point on the centreline) to the next
+  navigation item, which must be a NAV_WAYPOINT (B) further along the
+  centreline. Called from do_land()
+ */
+void RunwayTakeoff::init_landing(const AP_Mission::Mission_Command &cmd)
+{
+    land.line_valid = false;
+    land.rollout = false;
+    land.hold_hdg = false;
+    land.td_count = 0;
+    land.max_abs_xtrk = 0;
+    land.done = false;
+    land.rf_lost = false;
+    land.wl_factor = 1;
+    land.blend = 0;
+    land.last_steer_err = 0;
+    land.rf_above = -1;
+
+    if (!option_set(Option::RUNWAY_LANDING)) {
+        return;
+    }
+
+    if (wl_height_mode()) {
+        if (!state.rf_ref_valid) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: land runway level from GNDCLR %.2fm",
+                          (double)landing_rf_ref());
+        }
+    } else if (!wow_available()) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "RWY: landing needs RWY_WL_HGT or WoW");
+    }
+
+    const Location &a = cmd.content.location;
+    Location b;
+    if ((a.lat == 0 && a.lng == 0) || !waypoint_after(cmd.index, b)) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "RWY: no WAYPOINT after LAND, stock rollout");
+        return;
+    }
+    const float len = a.get_distance(b);
+    if (len < RWY_MIN_LINE_LENGTH_M) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "RWY: LAND to next WP only %.0fm, need %.0fm",
+                      (double)len, (double)RWY_MIN_LINE_LENGTH_M);
+        return;
+    }
+    land.point_a = a;
+    land.bearing_deg = wrap_360(degrees(a.get_bearing(b)));
+    land.line_valid = true;
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: land line brg %.1f len %.0fm",
+                  (double)land.bearing_deg, (double)len);
+
+    // the approach (previous waypoint to LAND) should lie along the line
+    if (plane.prev_WP_loc.get_distance(a) > RWY_MIN_LINE_LENGTH_M) {
+        const float app_err = wrap_180(degrees(plane.prev_WP_loc.get_bearing(a)) - land.bearing_deg);
+        if (fabsf(app_err) > RWY_LAND_APPROACH_TOL_DEG) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "RWY: approach %.0f deg off land line", (double)app_err);
+        }
+    }
+    if (plane.mission.continue_after_land()) {
+        // the mission would continue to point B once stopped
+        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "RWY: MIS_OPTIONS continue after land flies to B");
+    }
+}
+
+// true on the landing rollout, from touchdown until the landing ends
+bool RunwayTakeoff::landing_rollout() const
+{
+    return land.rollout && option_set(Option::RUNWAY_LANDING) &&
+           plane.control_mode == &plane.mode_auto &&
+           plane.flight_stage == AP_FixedWing::FlightStage::LAND;
+}
+
+// rangefinder reading on the runway: learned on this flight's takeoff,
+// otherwise the rangefinder's configured ground clearance
+float RunwayTakeoff::landing_rf_ref() const
+{
+    if (state.rf_ref_valid) {
+        return state.rf_ref;
+    }
+#if AP_RANGEFINDER_ENABLED
+    return plane.rangefinder.ground_clearance_orient(plane.rangefinder_orientation());
+#else
+    return 0;
+#endif
+}
+
+// RWY_WL_HGT: rangefinder height above the runway; 0 below its minimum range
+bool RunwayTakeoff::landing_height_above(float &above) const
+{
+    if (!wl_height_mode()) {
+        return false;
+    }
+    float hgt;
+    bool below_min;
+    if (!rangefinder_height(hgt, &below_min)) {
+        return false;
+    }
+    above = below_min ? 0 : MAX(hgt - landing_rf_ref(), 0);
+    return true;
+}
+
+/*
+  called at the navigation rate while the mission is on NAV_LAND:
+  touchdown detection, rollout reporting and logging
+ */
+void RunwayTakeoff::update_landing()
+{
+    if (!option_set(Option::RUNWAY_LANDING) || plane.control_mode != &plane.mode_auto) {
+        return;
+    }
+    if (plane.flight_stage != AP_FixedWing::FlightStage::LAND || !hal.util->get_soft_armed()) {
+        // go-around, or the landing is over
+        land.rollout = false;
+        land.td_count = 0;
+        return;
+    }
+
+    float xtrk = 0, along = 0, hdg_err = 0;
+    if (land.line_valid) {
+        line_errors(land.point_a, land.bearing_deg, xtrk, along);
+        hdg_err = wrap_180(plane.ahrs.get_yaw_deg() - land.bearing_deg);
+    }
+    float above;
+    const bool have_hgt = landing_height_above(above);
+    land.rf_above = have_hgt ? above : -1;
+    const float gspd = plane.ahrs.groundspeed();
+
+    if (!land.rollout) {
+        // touchdown: the rangefinder at runway level, or weight on wheels
+        bool on_ground = false;
+        if (have_hgt) {
+            on_ground = above < RWY_TD_HGT_M;
+#if AP_LANDINGGEAR_ENABLED
+        } else if (wow_available()) {
+            on_ground = plane.g2.landing_gear.get_wow_state() == AP_LandingGear::LG_WOW;
+#endif
+        }
+        if (!on_ground) {
+            land.td_count = 0;
+        } else if (++land.td_count >= RWY_TD_DEBOUNCE_COUNT) {
+            land.rollout = true;
+            land.td_ms = AP_HAL::millis();
+            land.max_abs_xtrk = fabsf(xtrk);
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: touchdown xt %.1fm hdg err %.1f spd %.1f",
+                          (double)xtrk, (double)hdg_err, (double)gspd);
+        }
+    } else {
+        land.max_abs_xtrk = MAX(land.max_abs_xtrk, fabsf(xtrk));
+        if (!land.done && gspd < RWY_LAND_STOP_SPEED) {
+            land.done = true;
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: rollout done xt %.1fm, max %.1fm",
+                          (double)xtrk, (double)land.max_abs_xtrk);
+        }
+    }
+
+    if (plane.landing.is_flaring() || land.rollout || land.wl_factor < 1) {
+        write_landing_log(xtrk, along, hdg_err, gspd);
+    }
+}
+
+/*
+  landing rollout steering. Same law as the takeoff roll, with the
+  lookahead held at RWY_LOOK_MAX as the whole rollout is deceleration,
+  cross-faded in from the stock steering over RWY_BLEND from touchdown,
+  and softened under braking (RWY_BRK_GAIN). Without a line only the
+  softening is applied to the stock steering
+ */
+void RunwayTakeoff::landing_steering_error(int32_t &bearing_error_cd)
+{
+    float err = bearing_error_cd * 0.01f;
+
+    if (land.line_valid) {
+        const float cap = constrain_float(max_corr, 1, 45);
+        const float gspd = plane.ahrs.groundspeed();
+        float xtrk, along;
+        line_errors(land.point_a, land.bearing_deg, xtrk, along);
+
+        if (!is_positive(look_max) || !gps_position_ok()) {
+            // as after an abort: hold the runway direction for the rest
+            // of the rollout, so a position jump can't steer us
+            land.hold_hdg = true;
+        }
+        float law;
+        if (gspd < RWY_ABORT_CENTRE_SPEED) {
+            law = 0;
+        } else if (land.hold_hdg) {
+            law = wrap_180(land.bearing_deg - plane.ahrs.get_yaw_deg());
+        } else {
+            const float look = MAX(look_max, RWY_MIN_LOOKAHEAD_M);
+            const float xt_corr = constrain_float(-degrees(atan2f(xtrk, look)), -cap, cap);
+            law = wrap_180(land.bearing_deg + xt_corr - plane.ahrs.get_yaw_deg());
+        }
+        law = constrain_float(law, -cap, cap);
+
+        float blend = 1;
+        if (is_positive(blend_time)) {
+            blend = constrain_float((AP_HAL::millis() - land.td_ms) * 0.001f / blend_time, 0, 1);
+        }
+        land.blend = blend;
+        err += (law - err) * blend;
+    }
+
+    err *= state.steer_soft;
+    land.last_steer_err = err;
+    bearing_error_cd = int32_t(err * 100);
+}
+
+/*
+  called from the AUTO NAV_LAND roll calculation with the stock landing
+  roll limit. With RWY_ENABLE bits 1 and 2, the limit falls in
+  proportion to the height above the runway (RWY_WL_HGT), or with a
+  weight on wheels switch, and is zero from touchdown to the stop. It
+  rises again no faster than RWY_WL_FADE allows
+ */
+int32_t RunwayTakeoff::landing_roll_limit_cd(int32_t stock_limit_cd)
+{
+    const uint32_t now_us = AP_HAL::micros();
+    const float dt = constrain_float((now_us - land.last_wl_us) * 1.0e-6f, 0, 0.1f);
+    land.last_wl_us = now_us;
+
+    if (!option_set(Option::RUNWAY_LANDING) || !option_set(Option::WINGS_LEVEL) ||
+        plane.control_mode != &plane.mode_auto ||
+        plane.flight_stage != AP_FixedWing::FlightStage::LAND) {
+        land.wl_factor = 1;
+        return stock_limit_cd;
+    }
+
+    float target = 1;
+    float above;
+    if (land.rollout) {
+        target = 0;
+    } else if (landing_height_above(above)) {
+        target = constrain_float(above / wl_hgt, 0, 1);
+    } else {
+        if (wl_height_mode() && !land.rf_lost) {
+            land.rf_lost = true;
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "RWY: rangefinder lost, landing wings level off");
+        }
+#if AP_LANDINGGEAR_ENABLED
+        if (wow_available() && plane.g2.landing_gear.get_wow_state() == AP_LandingGear::LG_WOW) {
+            target = 0;
+        }
+#endif
+    }
+
+    if (target < land.wl_factor) {
+        land.wl_factor = target;
+    } else if (is_positive(wl_fade)) {
+        land.wl_factor = MIN(target, land.wl_factor + dt / wl_fade);
+    } else {
+        land.wl_factor = target;
+    }
+    return int32_t(stock_limit_cd * land.wl_factor);
+}
+
+void RunwayTakeoff::write_landing_log(float xtrk, float along, float hdg_err, float gspd)
+{
+#if HAL_LOGGING_ENABLED
+    // @LoggerMessage: RWYL
+    // @Description: Runway landing (RWY_ENABLE bit 2)
+    // @Field: TimeUS: Time since system startup
+    // @Field: XT: cross-track error from the landing line (LAND point to the next waypoint), +ve right
+    // @Field: AT: along-track distance past the LAND point
+    // @Field: HE: heading error relative to the landing line, +ve nose right
+    // @Field: SE: rollout steering heading error demand, +ve turn right
+    // @Field: Spd: ground speed
+    // @Field: TD: true from touchdown (rollout)
+    // @Field: H: rangefinder height above the runway, -1 if not available
+    // @Field: WL: roll limit factor applied, 0 wings held level to 1 stock limit
+    // @Field: Bl: fade from the stock steering to the rollout law, 0 to 1
+    // @Field: SF: steering softening factor applied under braking, 1 is none
+    AP::logger().WriteStreaming("RWYL", "TimeUS,XT,AT,HE,SE,Spd,TD,H,WL,Bl,SF", "smmddn-m---", "F0000000000",
+                                "QfffffBffff",
+                                AP_HAL::micros64(),
+                                (double)xtrk,
+                                (double)along,
+                                (double)hdg_err,
+                                (double)land.last_steer_err,
+                                (double)gspd,
+                                uint8_t(land.rollout),
+                                (double)land.rf_above,
+                                (double)land.wl_factor,
+                                (double)land.blend,
+                                (double)state.steer_soft);
+#endif
+}
+
 void RunwayTakeoff::get_line_errors(float &xtrk, float &along) const
 {
-    const Vector2f d = state.point_a.get_distance_NE(plane.current_loc);
-    const float hdg = radians(state.bearing_deg);
+    line_errors(state.point_a, state.bearing_deg, xtrk, along);
+}
+
+// position relative to a line through a on bearing_deg. xtrk +ve to the
+// right of the line looking along it, along = metres past a
+void RunwayTakeoff::line_errors(const Location &a, float bearing_deg, float &xtrk, float &along) const
+{
+    const Vector2f d = a.get_distance_NE(plane.current_loc);
+    const float hdg = radians(bearing_deg);
     const Vector2f u{cosf(hdg), sinf(hdg)};
     along = d.x * u.x + d.y * u.y;
-    // +ve to the right of the centreline looking in the takeoff direction
     xtrk = u.x * d.y - u.y * d.x;
+}
+
+/*
+  the next navigation command after index, if it is a NAV_WAYPOINT. The
+  mission state is not changed (get_next_nav_cmd() can modify DO_JUMP
+  counters)
+ */
+bool RunwayTakeoff::waypoint_after(uint16_t index, Location &loc) const
+{
+    AP_Mission::Mission_Command next {};
+    const uint16_t num_cmds = plane.mission.num_commands();
+    for (uint16_t i = index + 1; i < num_cmds; i++) {
+        if (!plane.mission.read_cmd_from_storage(i, next)) {
+            return false;
+        }
+        if (AP_Mission::is_nav_cmd(next)) {
+            if (next.id != MAV_CMD_NAV_WAYPOINT) {
+                return false;
+            }
+            loc = next.content.location;
+            return true;
+        }
+    }
+    return false;
 }
 
 // +ve when the nose is right of the A->B direction
@@ -1074,14 +1392,20 @@ bool RunwayTakeoff::reached_rotate_speed() const
   minimum range is returned; above its maximum, the maximum. False if
   it can't be used
  */
-bool RunwayTakeoff::rangefinder_height(float &hgt) const
+bool RunwayTakeoff::rangefinder_height(float &hgt, bool *below_min) const
 {
+    if (below_min != nullptr) {
+        *below_min = false;
+    }
 #if AP_RANGEFINDER_ENABLED
     const Rotation orient = plane.rangefinder_orientation();
     const RangeFinder &rf = plane.rangefinder;
     switch (rf.status_orient(orient)) {
     case RangeFinder::Status::OutOfRangeLow:
         hgt = rf.min_distance_orient(orient);
+        if (below_min != nullptr) {
+            *below_min = true;
+        }
         return true;
     case RangeFinder::Status::OutOfRangeHigh:
         hgt = rf.max_distance_orient(orient);

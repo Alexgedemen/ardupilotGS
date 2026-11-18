@@ -33,6 +33,11 @@
   RWY_WL_FADE once rotate speed is reached; with RWY_WL_HGT, in
   proportion to the downward rangefinder's height above the runway.
 
+  RWY_ENABLE bit 2 tracks the runway centreline on the landing rollout,
+  along the line from the NAV_LAND lat/lon to the next waypoint, with
+  the lookahead held at RWY_LOOK_MAX and the steering softened under
+  braking; with bit 1 the wings are held level near and on the runway.
+
   With RWY_ENABLE=0 the stock takeoff behaviour is unchanged.
  */
 
@@ -59,6 +64,7 @@ public:
     enum class Option : uint8_t {
         RUNWAY_TAKEOFF = (1U << 0),
         WINGS_LEVEL    = (1U << 1),
+        RUNWAY_LANDING = (1U << 2),
     };
 
     // bit 0 enables the feature; the other bits only act with it set
@@ -93,8 +99,8 @@ public:
     int32_t ground_roll_limit_cd(int32_t stock_limit_cd);
 
     // called from calc_nav_yaw_course(). Replaces the L1 bearing error
-    // with the runway ground steering error while on the takeoff roll
-    // or stopping after an abort.
+    // with the runway ground steering error while on the takeoff roll,
+    // stopping after an abort, or on a runway landing rollout.
     void ground_steering_error(int32_t &bearing_error_cd);
 
     // called at the navigation rate from verify_takeoff() for
@@ -111,6 +117,16 @@ public:
     // been calculated. Applies the brake override while aborted and
     // clears the abort latch when safe.
     void update_outputs();
+
+    // runway landing (RWY_ENABLE bit 2). init_landing() is called from
+    // do_land() with the NAV_LAND item; update_landing() at the
+    // navigation rate while on NAV_LAND
+    void init_landing(const AP_Mission::Mission_Command &cmd);
+    void update_landing();
+
+    // called from the AUTO NAV_LAND roll calculation with the stock
+    // landing roll limit. Returns the limit to apply
+    int32_t landing_roll_limit_cd(int32_t stock_limit_cd);
 
 private:
     // parameters
@@ -183,6 +199,25 @@ private:
         uint32_t last_brake_warn_ms;
     } state;
 
+    // runway landing
+    struct {
+        Location point_a;      // LAND item: touchdown point on the centreline
+        float bearing_deg;     // LAND point to the next waypoint
+        bool line_valid;
+        bool rollout;          // from touchdown until the landing ends
+        bool hold_hdg;         // latched: hold the runway direction
+        bool done;             // rollout done reported
+        bool rf_lost;          // rangefinder failure reported
+        uint8_t td_count;      // consecutive cycles at runway level
+        uint32_t td_ms;        // touchdown time
+        uint32_t last_wl_us;
+        float wl_factor;       // roll limit factor, 0 (level) to 1 (stock)
+        float blend;           // fade from the stock steering, 0 to 1
+        float last_steer_err;  // deg, for logging
+        float max_abs_xtrk;
+        float rf_above;        // m, rangefinder height above the runway, -1 if none
+    } land;
+
     // causes of deceleration, logged in RWYT.DC
     enum class DecelFlag : uint8_t {
         BRAKES   = (1U << 0),
@@ -193,12 +228,14 @@ private:
     // geometry relative to the runway line. xtrk +ve = right of the
     // centreline looking from A to B, along = metres past A towards B
     void get_line_errors(float &xtrk, float &along) const;
+    void line_errors(const Location &a, float bearing_deg, float &xtrk, float &along) const;
+    bool waypoint_after(uint16_t index, Location &loc) const;
     float heading_error_deg() const;
     float speed_for_v1() const;
     bool abort_enabled() const;
     bool reached_rotate_speed() const;
     bool wl_height_mode() const { return is_positive(wl_hgt); }
-    bool rangefinder_height(float &hgt) const;
+    bool rangefinder_height(float &hgt, bool *below_min = nullptr) const;
     float lookahead_m(float gspd) const;
     void update_brakes();
     float brake_fraction() const;
@@ -214,6 +251,12 @@ private:
     bool engine_switch_in_run() const;
     void refuse(const char *fmt, ...) FMT_PRINTF(2, 3);
     void write_log(float xtrk, float along, float hdg_err, float spd);
+
+    bool landing_rollout() const;
+    float landing_rf_ref() const;
+    bool landing_height_above(float &above) const;
+    void landing_steering_error(int32_t &bearing_error_cd);
+    void write_landing_log(float xtrk, float along, float hdg_err, float gspd);
 };
 
 #endif // AP_PLANE_RUNWAY_TAKEOFF_ENABLED
