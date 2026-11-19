@@ -244,7 +244,12 @@ bool Plane::verify_command(const AP_Mission::Mission_Command& cmd)        // Ret
         runway_takeoff.update_landing();
 #endif
         if (flight_stage == AP_FixedWing::FlightStage::ABORT_LANDING) {
-            return landing.verify_abort_landing(prev_WP_loc, next_WP_loc, current_loc, auto_state.takeoff_altitude_rel_cm, throttle_suppressed);
+            const bool abort_done = landing.verify_abort_landing(prev_WP_loc, next_WP_loc, current_loc, auto_state.takeoff_altitude_rel_cm, throttle_suppressed);
+#if AP_PLANE_RUNWAY_TAKEOFF_ENABLED
+            // a go-around from the runway landing rollout tracks the runway line
+            runway_takeoff.update_go_around();
+#endif
+            return abort_done;
 
         } else {
             // use rangefinder to correct if possible

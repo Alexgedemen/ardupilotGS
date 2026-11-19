@@ -85,9 +85,17 @@
 #define RWY_RF_GROUND_MAX_M 2.0f
 
 // runway landing: touchdown when the rangefinder is within this height of
-// the runway for this many navigation cycles (10Hz)
+// the runway, and the aircraft is not climbing faster than this, for this
+// many navigation cycles (10Hz)
 #define RWY_TD_HGT_M 0.15f
+#define RWY_TD_CLIMB_MAX 0.2f
 #define RWY_TD_DEBOUNCE_COUNT 3
+// a bounce: the rangefinder this high above the runway again for this
+// many navigation cycles after touchdown
+#define RWY_BOUNCE_HGT_M 0.3f
+#define RWY_BOUNCE_COUNT 2
+// time to move the elevator from its value at touchdown to RWY_LND_ELEV
+#define RWY_LND_ELEV_RAMP_S 1.0f
 // ground speed at which the rollout is reported as done
 #define RWY_LAND_STOP_SPEED 1.0f
 // warn if the approach (previous waypoint to LAND) is further off the
@@ -103,7 +111,7 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: ENABLE
     // @DisplayName: Runway takeoff enable
-    // @Description: Bit 0 enables runway centreline tracking for AUTO takeoffs. The runway line runs from the NAV_TAKEOFF item lat/lon (point A, surveyed centreline point at the start end) to the next mission waypoint (point B, surveyed centreline point at the departure end or beyond). When enabled, auto takeoff is refused if the runway is not defined or the start checks fail. Bit 1 holds the wings level on the ground: no bank demand from the start of the roll until TKOFF_ROTATE_SPD (RWY_V1 if that is 0) or, if a weight on wheels switch is configured, while it reads on the ground, and throughout an abort; then the stock takeoff roll limit is restored over RWY_WL_FADE. Bit 2 is the runway landing: on the rollout the steering tracks the line from the NAV_LAND lat/lon (the touchdown point on the centreline) to the next mission item, which must be a waypoint further along the centreline, with the lookahead held at RWY_LOOK_MAX and the steering softened under braking (RWY_BRK_GAIN). Touchdown is seen by the rangefinder (RWY_WL_HGT) or a weight on wheels switch. With bits 1 and 2 the wings are also held level near and on the runway on landing. The other bits do nothing unless bit 0 is set.
+    // @Description: Bit 0 enables runway centreline tracking for AUTO takeoffs. The runway line runs from the NAV_TAKEOFF item lat/lon (point A, surveyed centreline point at the start end) to the next mission waypoint (point B, surveyed centreline point at the departure end or beyond). When enabled, auto takeoff is refused if the runway is not defined or the start checks fail. Bit 1 holds the wings level on the ground: no bank demand from the start of the roll until TKOFF_ROTATE_SPD (RWY_V1 if that is 0) or, if a weight on wheels switch is configured, while it reads on the ground, and throughout an abort; then the stock takeoff roll limit is restored over RWY_WL_FADE. Bit 2 is the runway landing: on the rollout the steering tracks the line from the NAV_LAND lat/lon (the touchdown point on the centreline) to the next mission item, which must be a waypoint further along the centreline, with the lookahead held at RWY_LOOK_MAX and the steering softened under braking (RWY_BRK_GAIN). Touchdown is seen by the rangefinder (RWY_WL_HGT) or a weight on wheels switch, and only while not climbing; leaving the runway again is a bounce, flown as still airborne until the wheels are down again. RWY_LND_ELEV can hold the nose down on the rollout. A go-around commanded after touchdown is flown as a runway takeoff along the landing line. With bits 1 and 2 the wings are also held level near and on the runway on landing. The other bits do nothing unless bit 0 is set.
     // @Bitmask: 0:Runway takeoff,1:Wings level on the ground,2:Runway landing
     // @User: Advanced
     AP_GROUPINFO_FLAGS("ENABLE", 1, RunwayTakeoff, enable, 0, AP_PARAM_FLAG_ENABLE),
@@ -242,12 +250,21 @@ const AP_Param::GroupInfo RunwayTakeoff::var_info[] = {
 
     // @Param: WL_HGT
     // @DisplayName: Wings level hand-back height
-    // @Description: With RWY_ENABLE bit 1 set, if non-zero, the roll limit is handed back by height above the runway instead of by time alone: after rotate speed it rises in proportion to the downward rangefinder's height above its reading on the runway, reaching the stock takeoff roll limit at this height, and drops back if the aircraft settles or bounces. It still rises no faster than RWY_WL_FADE allows. Uses the rangefinder set by RNGFND_LND_ORNT (pointing down by default); takeoff is refused if it is not working, and if it fails after rotate speed the hand-back continues by time. On a runway landing (RWY_ENABLE bits 1 and 2) the limit falls in proportion to the height above the runway in the same way, and touchdown is when the height is under 0.15 m; the runway level learned on takeoff is used, or RNGFND1_GNDCLR if there was none. 0 hands back by time only.
+    // @Description: With RWY_ENABLE bit 1 set, if non-zero, the roll limit is handed back by height above the runway instead of by time alone: after rotate speed it rises in proportion to the downward rangefinder's height above its reading on the runway, reaching the stock takeoff roll limit at this height, and drops back if the aircraft settles or bounces. It still rises no faster than RWY_WL_FADE allows. Uses the rangefinder set by RNGFND_LND_ORNT (pointing down by default); takeoff is refused if it is not working, and if it fails after rotate speed the hand-back continues by time. On a runway landing (RWY_ENABLE bits 1 and 2) the limit falls in proportion to the height above the runway in the same way, and touchdown is when the height is under 0.15 m while not climbing (over 0.3 m again is a bounce); the runway level learned on takeoff is used, or RNGFND1_GNDCLR if there was none. 0 hands back by time only.
     // @Units: m
     // @Range: 0 10
     // @Increment: 0.1
     // @User: Advanced
     AP_GROUPINFO("WL_HGT", 19, RunwayTakeoff, wl_hgt, 0),
+
+    // @Param: LND_ELEV
+    // @DisplayName: Landing rollout elevator
+    // @Description: On a runway landing (RWY_ENABLE bit 2), the elevator held on the rollout from a confirmed touchdown instead of the stock flare pitch demand, as a percentage of full travel; negative is down elevator, holding the nosewheel on the runway for steering. It is reached over 1 s from the elevator at touchdown, and released at once on a bounce or go-around. The landing counterpart of TKOFF_TDRAG_ELEV; as there, too much down elevator can make the steering unstable. 0 keeps the stock flare pitch demand.
+    // @Units: %
+    // @Range: -100 100
+    // @Increment: 1
+    // @User: Advanced
+    AP_GROUPINFO("LND_ELEV", 20, RunwayTakeoff, lnd_elev, 0),
 
     AP_GROUPEND
 };
@@ -269,6 +286,7 @@ void RunwayTakeoff::init(const AP_Mission::Mission_Command &cmd)
     // a mission restart; it is only cleared in update_outputs()
     state.line_valid = false;
     state.roll_started = false;
+    state.go_around = false;
     state.past_v1 = false;
     state.abort_count = 0;
     state.max_abs_xtrk = 0;
@@ -1027,6 +1045,12 @@ void RunwayTakeoff::init_landing(const AP_Mission::Mission_Command &cmd)
     land.blend = 0;
     land.last_steer_err = 0;
     land.rf_above = -1;
+    land.touched = false;
+    land.air_count = 0;
+    land.bounces = 0;
+    land.elev_start_valid = false;
+    land.elev_out = 0;
+    end_go_around();
 
     if (!option_set(Option::RUNWAY_LANDING)) {
         return;
@@ -1111,7 +1135,7 @@ bool RunwayTakeoff::landing_height_above(float &above) const
 
 /*
   called at the navigation rate while the mission is on NAV_LAND:
-  touchdown detection, rollout reporting and logging
+  touchdown and bounce detection, rollout reporting and logging
  */
 void RunwayTakeoff::update_landing()
 {
@@ -1122,6 +1146,7 @@ void RunwayTakeoff::update_landing()
         // go-around, or the landing is over
         land.rollout = false;
         land.td_count = 0;
+        land.air_count = 0;
         return;
     }
 
@@ -1136,7 +1161,8 @@ void RunwayTakeoff::update_landing()
     const float gspd = plane.ahrs.groundspeed();
 
     if (!land.rollout) {
-        // touchdown: the rangefinder at runway level, or weight on wheels
+        // touchdown: the rangefinder at runway level, or weight on wheels,
+        // and not climbing, so a bounce on its way up doesn't count
         bool on_ground = false;
         if (have_hgt) {
             on_ground = above < RWY_TD_HGT_M;
@@ -1145,18 +1171,45 @@ void RunwayTakeoff::update_landing()
             on_ground = plane.g2.landing_gear.get_wow_state() == AP_LandingGear::LG_WOW;
 #endif
         }
-        if (!on_ground) {
+        const bool climbing = plane.auto_state.sink_rate < -RWY_TD_CLIMB_MAX;
+        if (!on_ground || climbing) {
             land.td_count = 0;
         } else if (++land.td_count >= RWY_TD_DEBOUNCE_COUNT) {
             land.rollout = true;
+            land.touched = true;
             land.td_ms = AP_HAL::millis();
-            land.max_abs_xtrk = fabsf(xtrk);
+            land.air_count = 0;
+            land.elev_start_valid = false;
+            if (land.bounces == 0) {
+                land.max_abs_xtrk = fabsf(xtrk);
+            }
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: touchdown xt %.1fm hdg err %.1f spd %.1f",
                           (double)xtrk, (double)hdg_err, (double)gspd);
         }
     } else {
+        // bounce: off the runway again. Flown as still airborne (stock
+        // flare steering and pitch, LEVEL_ROLL_LIMIT) until the wheels
+        // are down again
+        bool airborne = false;
+        if (have_hgt) {
+            airborne = above > RWY_BOUNCE_HGT_M;
+#if AP_LANDINGGEAR_ENABLED
+        } else if (wow_available()) {
+            airborne = plane.g2.landing_gear.get_wow_state() == AP_LandingGear::LG_NO_WOW;
+#endif
+        }
+        if (!airborne) {
+            land.air_count = 0;
+        } else if (++land.air_count >= RWY_BOUNCE_COUNT) {
+            land.rollout = false;
+            land.td_count = 0;
+            land.air_count = 0;
+            land.bounces++;
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "RWY: bounce %.1fm spd %.1f, flare until down",
+                          (double)(have_hgt ? above : 0), (double)gspd);
+        }
         land.max_abs_xtrk = MAX(land.max_abs_xtrk, fabsf(xtrk));
-        if (!land.done && gspd < RWY_LAND_STOP_SPEED) {
+        if (land.rollout && !land.done && gspd < RWY_LAND_STOP_SPEED) {
             land.done = true;
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: rollout done xt %.1fm, max %.1fm",
                           (double)xtrk, (double)land.max_abs_xtrk);
@@ -1219,8 +1272,9 @@ void RunwayTakeoff::landing_steering_error(int32_t &bearing_error_cd)
   called from the AUTO NAV_LAND roll calculation with the stock landing
   roll limit. With RWY_ENABLE bits 1 and 2, the limit falls in
   proportion to the height above the runway (RWY_WL_HGT), or with a
-  weight on wheels switch, and is zero from touchdown to the stop. It
-  rises again no faster than RWY_WL_FADE allows
+  weight on wheels switch, and is zero from touchdown to the stop. In
+  a bounce it is the stock limit (LEVEL_ROLL_LIMIT in the flare) until
+  the wheels are down again. It rises no faster than RWY_WL_FADE allows
  */
 int32_t RunwayTakeoff::landing_roll_limit_cd(int32_t stock_limit_cd)
 {
@@ -1239,6 +1293,9 @@ int32_t RunwayTakeoff::landing_roll_limit_cd(int32_t stock_limit_cd)
     float above;
     if (land.rollout) {
         target = 0;
+    } else if (land.touched) {
+        // a bounce: still airborne, with the stock flare limit
+        target = 1;
     } else if (landing_height_above(above)) {
         target = constrain_float(above / wl_hgt, 0, 1);
     } else {
@@ -1263,6 +1320,139 @@ int32_t RunwayTakeoff::landing_roll_limit_cd(int32_t stock_limit_cd)
     return int32_t(stock_limit_cd * land.wl_factor);
 }
 
+/*
+  called from stabilize_pitch(). On a runway landing rollout, from a
+  confirmed touchdown, hold RWY_LND_ELEV elevator instead of the stock
+  flare pitch demand, reached over RWY_LND_ELEV_RAMP_S from the elevator
+  at touchdown. Returns false when the stock pitch control applies
+ */
+bool RunwayTakeoff::landing_elevator(float &elevator_cd)
+{
+    if (lnd_elev == 0 || !landing_rollout()) {
+        land.elev_out = 0;
+        return false;
+    }
+    const uint32_t now_ms = AP_HAL::millis();
+    if (!land.elev_start_valid) {
+        land.elev_start = SRV_Channels::get_output_scaled(SRV_Channel::k_elevator);
+        land.elev_start_valid = true;
+        land.elev_ms = now_ms;
+    }
+    // a percentage of travel to the -4500..4500 scaled output, as for
+    // TKOFF_TDRAG_ELEV
+    const float hold = 45.0f * lnd_elev;
+    const float frac = constrain_float((now_ms - land.elev_ms) * 0.001f / RWY_LND_ELEV_RAMP_S, 0, 1);
+    elevator_cd = land.elev_start + (hold - land.elev_start) * frac;
+    land.elev_out = elevator_cd;
+    return true;
+}
+
+/*
+  called from set_flight_stage() as a landing abort starts, before the
+  stock go-around is flown. After a confirmed touchdown it becomes a
+  runway takeoff
+ */
+void RunwayTakeoff::landing_aborted()
+{
+    if (land.rollout && option_set(Option::RUNWAY_LANDING) &&
+        plane.control_mode == &plane.mode_auto && hal.util->get_soft_armed()) {
+        start_go_around();
+    }
+    land.rollout = false;
+}
+
+/*
+  a go-around commanded after a confirmed touchdown (DO_GO_AROUND, or
+  the throttle stick with LAND_ABORT_THR) is flown as a runway takeoff
+  along the landing line: the takeoff steering law, wings level until
+  rotate speed, and the stock rotate-speed gate on the pitch. The
+  below-V1 abort is not armed: a go-around must never stop the engine
+ */
+void RunwayTakeoff::start_go_around()
+{
+    if (!land.line_valid) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "RWY: go-around, no landing line, stock");
+        return;
+    }
+    const uint32_t now_ms = AP_HAL::millis();
+    state.point_a = land.point_a;
+    state.point_b = land.point_a;
+    state.point_b.offset_bearing(land.bearing_deg, RWY_LINE_EXTEND_M);
+    state.bearing_deg = land.bearing_deg;
+    state.length_m = RWY_LINE_EXTEND_M;
+    state.l1_start = land.point_a;
+    state.l1_start.offset_bearing(wrap_360(land.bearing_deg + 180), RWY_LINE_EXTEND_M);
+    state.l1_end = state.point_b;
+    state.line_valid = true;
+    state.roll_started = true;
+    state.go_around = true;
+    state.past_v1 = true;
+    state.past_rotate = false;
+    state.abort_count = 0;
+    state.max_abs_xtrk = 0;
+    state.rf_lost = false;
+    state.launch_ms = now_ms;
+    state.last_report_ms = now_ms;
+    // the steering is already on the line: no fade-in, and start from the
+    // rollout's long lookahead so neither steps
+    state.blend_start_ms = MAX(now_ms - uint32_t(MAX(blend_time.get(), 0.0f) * 1000), 1U);
+    state.blend = 1;
+    state.decel_frac = 1;
+
+    // the rotate-speed gate and the end of the wings level ground phase
+    // count speed from now, not from the original takeoff
+    plane.auto_state.highest_airspeed = 0;
+    plane.auto_state.rotation_complete = false;
+    plane.steer_state.hold_course_cd = runway_heading_cd();
+
+    float xtrk, along;
+    get_line_errors(xtrk, along);
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: go-around from rollout xt %.1fm, as takeoff",
+                  (double)xtrk);
+}
+
+/*
+  called at the navigation rate during a landing abort, after the stock
+  go-around navigation. While a go-around from the rollout is flown as
+  a runway takeoff, track the landing line rather than the approach
+  heading, and log
+ */
+void RunwayTakeoff::update_go_around()
+{
+    if (!state.go_around) {
+        return;
+    }
+    if (plane.control_mode != &plane.mode_auto || !hal.util->get_soft_armed() ||
+        plane.flight_stage != AP_FixedWing::FlightStage::ABORT_LANDING ||
+        plane.mission.get_current_nav_cmd().id != MAV_CMD_NAV_LAND ||
+        plane.adjusted_relative_altitude_cm() > plane.auto_state.takeoff_altitude_rel_cm) {
+        // climb-out done (the landing sequence restarts), or abandoned
+        end_go_around();
+        return;
+    }
+
+    update_l1();
+
+    float xtrk, along;
+    get_line_errors(xtrk, along);
+    const float hdg_err = heading_error_deg();
+    update_ground_phase();
+    state.max_abs_xtrk = MAX(state.max_abs_xtrk, fabsf(xtrk));
+    write_log(xtrk, along, hdg_err, speed_for_v1());
+}
+
+void RunwayTakeoff::end_go_around()
+{
+    if (!state.go_around) {
+        return;
+    }
+    state.go_around = false;
+    state.roll_started = false;
+    state.line_valid = false;
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "RWY: go-around climb-out done, max xt %.1fm",
+                  (double)state.max_abs_xtrk);
+}
+
 void RunwayTakeoff::write_landing_log(float xtrk, float along, float hdg_err, float gspd)
 {
 #if HAL_LOGGING_ENABLED
@@ -1279,8 +1469,10 @@ void RunwayTakeoff::write_landing_log(float xtrk, float along, float hdg_err, fl
     // @Field: WL: roll limit factor applied, 0 wings held level to 1 stock limit
     // @Field: Bl: fade from the stock steering to the rollout law, 0 to 1
     // @Field: SF: steering softening factor applied under braking, 1 is none
-    AP::logger().WriteStreaming("RWYL", "TimeUS,XT,AT,HE,SE,Spd,TD,H,WL,Bl,SF", "smmddn-m---", "F0000000000",
-                                "QfffffBffff",
+    // @Field: Bn: bounces so far on this landing
+    // @Field: EL: elevator held on the rollout (RWY_LND_ELEV), percent; 0 when not held
+    AP::logger().WriteStreaming("RWYL", "TimeUS,XT,AT,HE,SE,Spd,TD,H,WL,Bl,SF,Bn,EL", "smmddn-m----%", "F000000000000",
+                                "QfffffBffffBf",
                                 AP_HAL::micros64(),
                                 (double)xtrk,
                                 (double)along,
@@ -1291,7 +1483,9 @@ void RunwayTakeoff::write_landing_log(float xtrk, float along, float hdg_err, fl
                                 (double)land.rf_above,
                                 (double)land.wl_factor,
                                 (double)land.blend,
-                                (double)state.steer_soft);
+                                (double)state.steer_soft,
+                                land.bounces,
+                                (double)(land.elev_out / 45.0f));
 #endif
 }
 

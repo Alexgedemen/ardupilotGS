@@ -597,6 +597,10 @@ void Plane::set_flight_stage(AP_FixedWing::FlightStage fs)
     if (fs == AP_FixedWing::FlightStage::ABORT_LANDING) {
         gcs().send_text(MAV_SEVERITY_NOTICE, "Landing aborted, climbing to %dm",
                         int(auto_state.takeoff_altitude_rel_cm/100));
+#if AP_PLANE_RUNWAY_TAKEOFF_ENABLED
+        // a go-around from the runway landing rollout is a runway takeoff
+        runway_takeoff.landing_aborted();
+#endif
     }
 
     flight_stage = fs;

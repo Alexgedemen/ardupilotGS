@@ -128,6 +128,16 @@ public:
     // landing roll limit. Returns the limit to apply
     int32_t landing_roll_limit_cd(int32_t stock_limit_cd);
 
+    // called from stabilize_pitch(). True, with the elevator to hold,
+    // on a runway landing rollout with RWY_LND_ELEV set
+    bool landing_elevator(float &elevator_cd);
+
+    // called as a landing abort starts, and during it after the stock
+    // go-around navigation; a go-around from the rollout is flown as a
+    // runway takeoff
+    void landing_aborted();
+    void update_go_around();
+
 private:
     // parameters
     AP_Int8  enable;
@@ -148,6 +158,7 @@ private:
     AP_Float brk_gain;         // steering gain at full brake, 1 disables
     AP_Float brk_tmax;         // s, brake operating time warning, 0 disables
     AP_Float wl_hgt;           // m, wings level hand-back by height, 0 disables
+    AP_Int8  lnd_elev;         // %, landing rollout elevator, 0 disables
 
     struct {
         Location point_a;      // TAKEOFF item: start of the runway line
@@ -158,6 +169,7 @@ private:
         float length_m;        // A->B
         bool line_valid;
         bool roll_started;
+        bool go_around;        // a go-around from the landing rollout, flown as a runway takeoff
         bool past_v1;
         bool aborted;
         bool we_set_estop;
@@ -216,6 +228,13 @@ private:
         float last_steer_err;  // deg, for logging
         float max_abs_xtrk;
         float rf_above;        // m, rangefinder height above the runway, -1 if none
+        bool touched;          // a touchdown has been confirmed on this landing
+        uint8_t air_count;     // consecutive cycles off the runway on the rollout
+        uint8_t bounces;
+        bool elev_start_valid;
+        float elev_start;      // elevator output at touchdown, -4500..4500
+        uint32_t elev_ms;
+        float elev_out;        // elevator held, -4500..4500, 0 when not held
     } land;
 
     // causes of deceleration, logged in RWYT.DC
@@ -257,6 +276,8 @@ private:
     bool landing_height_above(float &above) const;
     void landing_steering_error(int32_t &bearing_error_cd);
     void write_landing_log(float xtrk, float along, float hdg_err, float gspd);
+    void start_go_around();
+    void end_go_around();
 };
 
 #endif // AP_PLANE_RUNWAY_TAKEOFF_ENABLED

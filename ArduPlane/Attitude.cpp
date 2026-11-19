@@ -200,6 +200,14 @@ void Plane::stabilize_pitch()
         SRV_Channels::set_output_scaled(SRV_Channel::k_elevator, 45*force_elevator);
         return;
     }
+#if AP_PLANE_RUNWAY_TAKEOFF_ENABLED
+    float runway_elevator;
+    if (runway_takeoff.landing_elevator(runway_elevator)) {
+        // runway landing rollout: hold the nosewheel down (RWY_LND_ELEV)
+        SRV_Channels::set_output_scaled(SRV_Channel::k_elevator, runway_elevator);
+        return;
+    }
+#endif
 
     float pitch_out = stabilize_pitch_get_pitch_out();
 
