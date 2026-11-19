@@ -12,7 +12,8 @@ scenarios: stock, track, refuse, nodef, nowp, abort, abort_steer, past_v1,
            mission, all (default)
            wl, field, abort_return, abort_soft, brake_slip, brake_free,
            brake_time, gps_acc, abort_hdg, abort_hdg_return, wl_rf,
-           wl_rf_none, land_stock, land_rwy (not in all)
+           wl_rf_none, land_stock, land_rwy, land_bounce, land_ga_stock,
+           land_ga_rwy (not in all)
 
 After each scenario the newest dataflash log is summarised (RWYT, ATT,
 PIDS, GPS). RWY_BINARY overrides the SITL binary, for A/B runs.
@@ -181,7 +182,7 @@ class Sim:
         elif t == "SERVO_OUTPUT_RAW":
             self.brake_pwm.append((time.time(), m.servo9_raw, m.servo3_raw, m.time_usec * 1e-6))
         elif t == "NAV_CONTROLLER_OUTPUT":
-            self.navroll.append((time.time(), m.nav_roll))
+            self.navroll.append((time.time(), m.nav_roll, m.nav_pitch))
         elif t == "ATTITUDE":
             self.att.append((time.time(), math.degrees(m.yaw), math.degrees(m.yawspeed)))
 
@@ -374,6 +375,17 @@ def log_report(path, minspd):
                   "end XT %+.2f m; min SF %.2f; Bl reached %.2f" % (
                       t_td * 1e-6, td[0].XT, td[0].HE, td[0].Spd, max(abs(r.XT) for r in td), td[-1].XT,
                       min(r.SF for r in td), max(r.Bl for r in td)))
+            if "Bn" in rwyl[0].get_fieldnames():
+                # rollout elevator, and the TD / WL sequence through any bounce
+                seq = []
+                for r in rwyl:
+                    if r.TimeUS >= t_td and (not seq or seq[-1][1] != r.TD):
+                        seq.append((r.TimeUS, r.TD))
+                print("  log RWYL: bounces %d; TD changes at %s; EL %.0f%% to %.0f%% on the rollout; "
+                      "max WL off the runway after touchdown %.2f" % (
+                          max(r.Bn for r in rwyl), ", ".join("%.1fs:%d" % (t * 1e-6, d) for (t, d) in seq),
+                          min(r.EL for r in td), max(r.EL for r in td),
+                          max([r.WL for r in rwyl if r.TimeUS > t_td and not r.TD] or [0])))
         else:
             print("  log RWYL: no touchdown seen")
         low = [r.TimeUS for r in rwyl if r.TD or 0 <= r.H < 0.5]
@@ -645,23 +657,69 @@ def mission_items_circuit():
     return items
 
 
-def land_extra(sim):
+def land_extra(sim, action=None):
     """fly the circuit; apply the RC brakes from touchdown; report the
-    landing rollout against the runway centreline"""
-    t_end = time.time() + 1500 / float(os.environ.get("RWY_SPEEDUP", "5"))
+    landing rollout against the runway centreline. action "bounce" fakes
+    a bounce at the rangefinder (for ~1 s of
+    sim time, by moving the simulated rangefinder up 0.8 m) just after
+    touchdown; "goaround" sends DO_GO_AROUND ~1 s
+    of sim time after touchdown"""
+    speedup = float(os.environ.get("RWY_SPEEDUP", "5"))
+    t_end = time.time() + 1500 / speedup
     braked = False
-    while time.time() < t_end and not any("Throttle disarmed" in t for t in sim.texts):
+    acted = False
+
+    def finished():
+        return any("Throttle disarmed" in t or "climb-out done" in t for t in sim.texts)
+    while time.time() < t_end and not finished():
         if not braked and any(("touchdown" in t or "Flare" in t) for t in sim.texts) and \
-                sim.track and sim.track[-1][4] < 0.5:
+                sim.track and sim.track[-1][4] < 0.5 and action != "goaround":
             braked = True
             sim.rc_override({9: 1900})
+        # touchdown: the runway landing's message, or (stock) on the runway after the flare
+        landed = any("RWY: touchdown" in t for t in sim.texts) or (
+            any("Flare" in t for t in sim.texts) and sim.track and sim.track[-1][4] < 0.2)
+        if not acted and action is not None and landed:
+            acted = True
+            sim.pump(1.0 / speedup)
+            if action == "bounce":
+                # raise the simulated rangefinder 0.8 m: it reads as a bounce
+                sim.set_param("SIM_SONAR_POS_Z", -0.8)
+                sim.pump(1.0 / speedup)
+                sim.set_param("SIM_SONAR_POS_Z", 0)
+            elif action == "goaround":
+                sim.t_goaround = time.time()
+                sim.mav.mav.command_long_send(1, 1, mavutil.mavlink.MAV_CMD_DO_GO_AROUND, 0,
+                                              0, 0, 0, 0, 0, 0, 0)
         sim.rc_override({})
-        sim.pump(0.5)
+        sim.pump(0.2 if action is not None else 0.5)
+    if action == "goaround":
+        t0 = getattr(sim, "t_goaround", None)
+        if t0 is None:
+            print("  go-around: not sent (no touchdown seen)")
+            return
+        after = [p for p in sim.track if p[0] >= t0]
+        gnd = [p for p in after if p[4] < 1.0]
+        t_air = next((p[0] for p in after if p[4] > 1.0), None)
+        nav_gnd = [(r, pt) for (t, r, pt) in sim.navroll if t >= t0 and (t_air is None or t < t_air)]
+        if gnd:
+            print("  go-around ground roll: %d samples, xt %+.2f -> %+.2f m (max |xt| %.2f), speed %.1f -> %.1f m/s" % (
+                len(gnd), gnd[0][1], gnd[-1][1], max(abs(p[1]) for p in gnd), gnd[0][3], gnd[-1][3]))
+        if nav_gnd:
+            print("  go-around on the ground: max |nav_roll| %.2f deg, nav_pitch %.1f to %.1f deg" % (
+                max(abs(r) for (r, _) in nav_gnd), min(pt for (_, pt) in nav_gnd), max(pt for (_, pt) in nav_gnd)))
+        air = [p for p in after if p[4] > 1.0]
+        if air:
+            print("  go-around: airborne at %.1f m/s, xt %+.2f m; reached %.0f m AGL" % (
+                air[0][3], air[0][1], max(p[4] for p in after)))
+        else:
+            print("  go-around: not airborne")
+        return
     top = max(range(len(sim.track)), key=lambda i: sim.track[i][4]) if sim.track else 0
     roll = [p for p in sim.track[top:] if p[4] < 0.5 and p[3] > 0.5]
     if roll:
         t_low = [p[0] for p in sim.track[top:] if p[4] < 0.5]
-        near = [abs(r) for (t, r) in sim.navroll if t_low and t >= t_low[0]]
+        near = [abs(r) for (t, r, _) in sim.navroll if t_low and t >= t_low[0]]
         if near:
             print("  landing: max |nav_roll| from 0.5 m above the runway to the end %.2f deg" % max(near))
         xs = [p[1] for p in roll]
@@ -763,11 +821,28 @@ def main():
         # RWY_WL_HGT set but no rangefinder: the takeoff must be refused
         p = dict(RWY_PARAMS, RWY_ENABLE=3, RWY_V1=13, TKOFF_THR_MAX=100, RWY_WL_HGT=2)
         results["wl_rf_none"] = scenario("RWY_WL_HGT without a rangefinder", p, 0.0, 0.0, 15)
+    if named("land_bounce") or named("land_ga_stock") or named("land_ga_rwy"):
+        rf = {"RNGFND1_TYPE": 100, "RNGFND1_ORIENT": 25, "RNGFND1_MIN": 0.3, "RNGFND1_MAX": 50}
+        p = dict(RWY_PARAMS, RWY_ENABLE=7, RWY_V1=13, TKOFF_THR_MAX=100, RWY_WL_HGT=2, RWY_LOOK_MAX=50,
+                 RWY_BRK_GAIN=0.6, STEER2SRV_I=0.2, RWY_LND_ELEV=-20, TKOFF_GND_PITCH=0)
+        if named("land_bounce"):
+            results["land_bounce"] = scenario("runway landing, sensor bounce after touchdown", p, 0.0, 0.0, 0,
+                                              extra=lambda sim: land_extra(sim, "bounce"),
+                                              items_extra=mission_items_circuit(), boot_params=rf)
+        if named("land_ga_stock"):
+            results["land_ga_stock"] = scenario("go-around after touchdown, stock (RWY_ENABLE 3)",
+                                                dict(p, RWY_ENABLE=3), 0.0, 0.0, 0,
+                                                extra=lambda sim: land_extra(sim, "goaround"),
+                                                items_extra=mission_items_circuit(), boot_params=rf)
+        if named("land_ga_rwy"):
+            results["land_ga_rwy"] = scenario("go-around after touchdown, runway takeoff (RWY_ENABLE 7)", p,
+                                              0.0, 0.0, 0, extra=lambda sim: land_extra(sim, "goaround"),
+                                              items_extra=mission_items_circuit(), boot_params=rf)
     if named("land_stock") or named("land_rwy"):
         # take off, fly a circuit and land back on the runway in the crosswind
         rf = {"RNGFND1_TYPE": 100, "RNGFND1_ORIENT": 25, "RNGFND1_MIN": 0.3, "RNGFND1_MAX": 50}
         p = dict(RWY_PARAMS, RWY_ENABLE=3, RWY_V1=13, TKOFF_THR_MAX=100, RWY_WL_HGT=2, RWY_LOOK_MAX=50,
-                 RWY_BRK_GAIN=0.6, STEER2SRV_I=0.2)
+                 RWY_BRK_GAIN=0.6, STEER2SRV_I=0.2, RWY_LND_ELEV=float(os.environ.get("RWY_LND_ELEV", "0")))
         if named("land_stock"):
             results["land_stock"] = scenario("circuit, stock landing (RWY_ENABLE 3)", p, 0.0, 0.0, 0,
                                              extra=land_extra, items_extra=mission_items_circuit(),
